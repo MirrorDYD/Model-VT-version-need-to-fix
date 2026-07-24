@@ -1,1509 +1,1056 @@
-import { useState, useEffect, useMemo } from "react";
-import { ProcessedScenario, ShipmentGroup, PrEntry, MoqAlert, ExcessMcqOverride, SurchargeRule } from "../types";
-import { ShieldAlert, AlertTriangle, HelpCircle, Truck, Layers, Eye, Table, CheckSquare, Plus, Minus, Info, CheckCircle2, FileSpreadsheet, Download, RotateCcw, GripVertical, ChevronDown, ChevronUp, Pencil, X, Calendar, Trash2, Check } from "lucide-react";
-import { exportCombinedExcelReport, exportSeparatedExcelZip } from "../utils/excelExport";
+import React, { useState, useRef } from "react";
+import * as XLSX from "xlsx";
+import { Upload, Database, Check, AlertCircle, FileSpreadsheet, RefreshCw, HelpCircle } from "lucide-react";
+import { PrEntry } from "../types";
+import { loadSamplePrEntries } from "../data";
 import { Language, t } from "../utils/translate";
-import { getEffectiveMcqForColor } from "../optimizer";
 
-interface ScenarioInspectorProps {
-  scenario: ProcessedScenario;
-  scenarios: ProcessedScenario[];
-  exchangeRates: Record<string, number>;
+interface PrUploaderProps {
+  onDataLoaded: (entries: PrEntry[]) => void;
+  currentCount: number;
   lang: Language;
-  onMovePrLine?: (prId: string, targetWeek: number) => void;
-  onResetOverrides?: () => void;
-  hasManualOverrides?: boolean;
-  matrixQtyOverrides?: Record<string, number>;
-  onMatrixQtyChange?: (itemDescription: string, colorCode: string, week: number, value: number | null) => void;
-  onFixUnitPrice?: (itemCode: string, colorCode: string, value: number | null | "zero") => void;
-  entries?: PrEntry[];
-  maxWeeks?: number;
-  computedDates?: Date[];
-  shipmentDates?: string[];
-  setShipmentDates?: (dates: string[]) => void;
-  excessOverrides?: ExcessMcqOverride[];
-  setExcessOverrides?: (overrides: ExcessMcqOverride[]) => void;
-  surchargeRules?: SurchargeRule[];
-  mcqMoqPreferences?: Record<string, "surcharge" | "pr_file">;
-  onSelectMcqMoqPreference?: (key: string, choice: "surcharge" | "pr_file") => void;
-  onAcceptFlag?: (flagKey: string) => void;
 }
 
-// A small controlled/uncontrolled hybrid number input used inside the MCQ matrix cells.
-// Lets the user type a replacement quantity directly (no drag-and-drop). Commits on blur
-// or Enter; an empty value clears the manual override and reverts to the computed quantity.
-function EditableQtyCell({
-  overrideValue,
-  computedQty,
-  onCommit,
-  disabled
-}: {
-  overrideValue?: number;
-  computedQty: number;
-  onCommit: (value: number | null) => void;
-  disabled?: boolean;
-}) {
-  const effective = overrideValue !== undefined ? overrideValue : computedQty;
-  const format = (n: number) => (n > 0 ? String(Math.round(n * 100) / 100) : "");
-  const [text, setText] = useState<string>(format(effective));
-  const [isFocused, setIsFocused] = useState(false);
+export default function PrUploader({ onDataLoaded, currentCount, lang }: PrUploaderProps) {
+  const [dragActive, setDragActive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  
+  // States for interactive column mapping if auto-mapping fails
+  const [rawRows, setRawRows] = useState<any[] | null>(null);
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [mapping, setMapping] = useState<Record<string, string>>({
+    itemCode: "",
+    colorCode: "",
+    qty: "",
+    unitPrice: "",
+    prDueDate: "",
+    cbm: "",
+    moq: "",
+    daysEarlyExcel: "",
+    currencyRate: "",
+    currency: "",
+    vendor: ""
+  });
+  const [showMappingGui, setShowMappingGui] = useState(false);
 
-  // Keep the field in sync if the override is cleared elsewhere (e.g. Reset Assignments)
-  // or the underlying computed quantity changes — but never fight the user while they're typing.
-  useEffect(() => {
-    if (!isFocused) {
-      setText(format(effective));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effective, isFocused]);
+  // Row-aligned raw pass-through values (Ref.CO, Line, Term Description, etc.)
+  // captured by exact column name/position rather than the fuzzy auto-detect
+  // heuristics above. Needed for the Combined/Separated Excel exports to
+  // reproduce the uploaded PR file's values exactly.
+  const [extraRawFields, setExtraRawFields] = useState<Record<string, any>[]>([]);
 
-  const commit = () => {
-    setIsFocused(false);
-    const trimmed = text.trim();
-    if (trimmed === "") {
-      onCommit(null);
-      return;
-    }
-    const parsed = Number(trimmed.replace(/,/g, ""));
-    if (Number.isNaN(parsed) || parsed < 0) {
-      // Invalid entry, revert to last known good value
-      setText(format(effective));
-      return;
-    }
-    onCommit(parsed);
-  };
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  return (
-    <input
-      type="text"
-      inputMode="decimal"
-      disabled={disabled}
-      value={text}
-      placeholder="0"
-      onChange={(e) => {
-        const v = e.target.value;
-        // Allow empty, digits, and a single decimal point while typing
-        if (v === "" || /^[0-9]*\.?[0-9]*$/.test(v)) {
-          setText(v);
-        }
-      }}
-      onFocus={(e) => {
-        setIsFocused(true);
-        e.target.select();
-      }}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          (e.target as HTMLInputElement).blur();
-        } else if (e.key === "Escape") {
-          setText(format(effective));
-          setIsFocused(false);
-          (e.target as HTMLInputElement).blur();
-        }
-      }}
-      className="w-20 text-center font-mono font-bold bg-white border border-slate-300 rounded px-1.5 py-1 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 disabled:bg-slate-100 disabled:text-slate-400"
-    />
-  );
-}
+  // Builds one raw-field object per data row by reading the sheet positionally
+  // (header:1), since the source PR file commonly has duplicate header names
+  // (e.g. two "Line" columns, four "Currency" columns) that collide when
+  // parsed as a plain object via sheet_to_json's default named-key mode.
+  const buildExtraRawFields = (sheet: XLSX.WorkSheet, rowCount: number): Record<string, any>[] => {
+    const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }) as any[][];
+    if (aoa.length === 0) return [];
 
-export default function ScenarioInspector({ 
-  scenario, 
-  scenarios, 
-  exchangeRates, 
-  lang,
-  onMovePrLine,
-  onResetOverrides,
-  hasManualOverrides,
-  matrixQtyOverrides = {},
-  onMatrixQtyChange,
-  onFixUnitPrice,
-  entries = [],
-  maxWeeks = 12,
-  computedDates = [],
-  shipmentDates = [],
-  setShipmentDates = () => {},
-  excessOverrides = [],
-  setExcessOverrides = () => {},
-  surchargeRules = [],
-  mcqMoqPreferences = {},
-  onSelectMcqMoqPreference,
-  onAcceptFlag
-}: ScenarioInspectorProps) {
-  const [activeTab, setActiveTab] = useState<"colorSummary" | "colors" | "shipmentDates" | "excess" | "shipments" | "ledger" | "requisitions">("colorSummary");
-  const [draggedOverWeek, setDraggedOverWeek] = useState<number | null>(null);
-  const [showConsolidated, setShowConsolidated] = useState(false);
-  const [priceFixDrafts, setPriceFixDrafts] = useState<Record<string, string>>({});
-  const [isExportingSeparated, setIsExportingSeparated] = useState(false);
+    const headerRow = (aoa[0] || []).map(h => String(h ?? ""));
+    const bodyRows = aoa.slice(1);
 
-  // State for new excess override form (relocated from AdvancedSettings, now per-scenario)
-  const [newOverColor, setNewOverColor] = useState("");
-  const [newOverItemCode, setNewOverItemCode] = useState("");
-  const [newOverQty, setNewOverQty] = useState(0);
-  const [newOverWeek, setNewOverWeek] = useState<number>(0); // 0 means auto/any week
-
-  // Memoized unique colors and items for the selected color
-  const uniqueColors = useMemo(() => {
-    return Array.from(new Set(entries.map(e => e.colorCode))).sort();
-  }, [entries]);
-
-  const uniqueItems = useMemo(() => {
-    if (!newOverColor) return [];
-    return Array.from(new Set(
-      entries.filter(e => e.colorCode === newOverColor).map(e => e.itemCode)
-    )).sort();
-  }, [entries, newOverColor]);
-
-  // Sync color selection when entries change
-  useEffect(() => {
-    if (uniqueColors.length > 0 && (!newOverColor || !uniqueColors.includes(newOverColor))) {
-      setNewOverColor(uniqueColors[0]);
-    }
-  }, [uniqueColors, newOverColor]);
-
-  // Sync item selection when color changes
-  useEffect(() => {
-    setNewOverItemCode(""); // Default to "All Items" when color shifts
-  }, [newOverColor]);
-
-  const handleAddOverride = () => {
-    if (!newOverColor) return;
-
-    // Auto-lookup price and cbm per unit from raw entries
-    const matchingPr = entries.find(e =>
-      e.colorCode === newOverColor &&
-      (!newOverItemCode || e.itemCode === newOverItemCode)
-    );
-    const pricePerUnit = matchingPr ? matchingPr.unitPrice : undefined;
-    const cbmPerUnit = matchingPr && matchingPr.qty > 0 ? matchingPr.cbm / matchingPr.qty : 0.003;
-
-    const ov: ExcessMcqOverride = {
-      id: Math.random().toString(36).substring(2),
-      colorCode: newOverColor,
-      itemCode: newOverItemCode || undefined,
-      additionalQty: newOverQty,
-      pricePerUnit,
-      cbmPerUnit,
-      targetWeek: newOverWeek || undefined
+    const normalize = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+    const findIdx = (name: string, which: "first" | "last" = "first"): number => {
+      const target = normalize(name);
+      const matches: number[] = [];
+      headerRow.forEach((h, i) => { if (normalize(h) === target) matches.push(i); });
+      if (matches.length === 0) return -1;
+      return which === "first" ? matches[0] : matches[matches.length - 1];
     };
-    setExcessOverrides([...excessOverrides, ov]);
-    setNewOverItemCode("");
-    setNewOverQty(0);
-    setNewOverWeek(0);
+
+    const idxLine = findIdx("Line", "first");
+    const idxRefCo = findIdx("Ref.CO");
+    const idxTermDesc = findIdx("Term Description");
+    const idxIncoTermCode = findIdx("Inco Term Code");
+    const idxTechDesc = findIdx("Tech Desc"); // normalize() collapses the source's double space
+    const idxSeason = findIdx("Season");
+    const idxBuyer = findIdx("Buyer");
+    const idxPlanCost = findIdx("Plan Cost");
+    const idxPlanExtendedCost = findIdx("Plan Extended Cost");
+    const idxOrderMultiple = findIdx("Order Multiple");
+    const idxUnitWeight = findIdx("Unit Weight");
+    const idxUom = findIdx("U/M", "first");
+    const idxCurrencyAfterExtended = idxPlanExtendedCost >= 0 ? idxPlanExtendedCost + 1 : -1;
+
+    const getCell = (r: number, c: number): any => (c >= 0 && r < bodyRows.length && bodyRows[r] && bodyRows[r][c] !== undefined) ? bodyRows[r][c] : "";
+    const getStr = (r: number, c: number): string | undefined => {
+      const v = getCell(r, c);
+      return v !== "" && v !== null && v !== undefined ? String(v).trim() : undefined;
+    };
+    const getNum = (r: number, c: number): number | undefined => {
+      const v = getCell(r, c);
+      if (v === "" || v === null || v === undefined) return undefined;
+      const n = parseFloat(String(v).replace(/,/g, ""));
+      return isNaN(n) ? undefined : n;
+    };
+
+    const out: Record<string, any>[] = [];
+    for (let i = 0; i < rowCount; i++) {
+      out.push({
+        lineRaw: getStr(i, idxLine),
+        refCoRaw: getStr(i, idxRefCo),
+        termDescriptionRaw: getStr(i, idxTermDesc),
+        incoTermCodeRaw: getStr(i, idxIncoTermCode),
+        techDescRaw: getStr(i, idxTechDesc),
+        seasonRaw: getStr(i, idxSeason),
+        buyerRaw: getStr(i, idxBuyer),
+        planCostRaw: getNum(i, idxPlanCost),
+        planExtendedCostCurrencyRaw: getStr(i, idxCurrencyAfterExtended)?.toUpperCase(),
+        orderMultipleRaw: getNum(i, idxOrderMultiple),
+        unitWeightRaw: getNum(i, idxUnitWeight),
+        uomRaw: getStr(i, idxUom)
+      });
+    }
+    return out;
   };
 
-  const handleRemoveOverride = (id: string) => {
-    setExcessOverrides(excessOverrides.filter(o => o.id !== id));
-  };
+  // Auto-detect matching headers
+  const autoDetectMapping = (sheetHeaders: string[]): Record<string, string> => {
+    const map: Record<string, string> = {
+      itemCode: "",
+      itemDescription: "",
+      colorCode: "",
+      qty: "",
+      unitPrice: "",
+      prDueDate: "",
+      requisition: "",
+      cbm: "",
+      moq: "",
+      mcq: "",
+      shipFrom: "",
+      incoterm: "",
+      customerCode: "",
+      size: "",
+      daysEarlyExcel: "",
+      actualDelivery: "",
+      dueDateRaw: "",
+      currencyRate: "",
+      currency: "",
+      vendor: "",
+      transitLeadTimeDays: "",
+      consolidateWeekday: ""
+    };
 
-  // Group columns (shipments)
-  const shipmentColumns = scenario.shipments;
-  // Item-level breakdown for the MCQ Shipment Calendar Matrix — the same
-  // color code can span multiple distinct items/styles (e.g. two different
-  // garment styles sharing the same dye lot color), so the matrix needs a
-  // row per (item, color) pair, not just per color. Grouped by
-  // itemDescription rather than itemCode, since different item codes can
-  // share the same descriptive name and should be treated as one editable
-  // row, not split apart. MCQ itself still applies at the color level
-  // (it's a minimum dye-lot quantity, shared across every item of that
-  // color), so the pass/fail check aggregates across all items sharing a
-  // color — only the displayed/editable quantity is item-specific.
-  const colorItemPairs = useMemo(() => {
-    const seen = new Map<string, { itemDescription: string; colorCode: string }>();
-    scenario.processedEntries.forEach(e => {
-      const desc = e.itemDescription || e.itemCode;
-      const key = `${desc}__${e.colorCode}`;
-      if (!seen.has(key)) {
-        seen.set(key, { itemDescription: desc, colorCode: e.colorCode });
+    const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    let prDueDateScore = 0;
+    let itemCodeScore = 0;
+
+    sheetHeaders.forEach(h => {
+      const norm = normalize(h);
+
+      const isPrDeliveryCandidate = /pr\s*delivery|prdelivery|deliverydate|vendorloading|vendorloadingdate/.test(norm);
+      const isActualDeliveryCandidate = /actual\s*delivery|actualdelivery|actualdeliverydate/.test(norm);
+      const isGenericDelivery = /delivery|vendorloading|vendor\s*loading/.test(norm);
+
+      // Prefer explicit "Actual Delivery" headers first, then PR Delivery variants,
+      // then any generic delivery-like header as a last resort.
+      if (isActualDeliveryCandidate) {
+        map.actualDelivery = h;
+      } else if (isPrDeliveryCandidate && !map.actualDelivery) {
+        map.actualDelivery = h;
+      } else if (isGenericDelivery && !map.actualDelivery) {
+        map.actualDelivery = h;
+      }
+      // Preserve the literal "Due Date" column separately for display as
+      // "PR Due Date" in reports. This is independent of prDueDate scoring
+      // below (which correctly prioritizes "PR Delivery Date" for
+      // grouping/Days Early math) — Due Date and PR Delivery Date are two
+      // different real-world dates and must not be conflated.
+      if ((norm === "duedate" || norm.includes("requiredduedate")) && !map.dueDateRaw) {
+        map.dueDateRaw = h;
+      }
+
+      if (norm.includes("buyrate") || norm.includes("exchangerate") || norm.includes("exrate") || norm.includes("currencyrate") || (norm.includes("rate") && !norm.includes("carrying") && !norm.includes("interest") && !norm.includes("tax") && !norm.includes("urate"))) {
+        map.currencyRate = h;
+      } else if (norm === "currency" || norm === "curr" || norm === "currencycode" || norm === "currency_code") {
+        map.currency = h;
+      }
+      
+      if (norm === "vendor" || norm === "vendorcode" || norm === "vendor_code" || norm === "supplier") {
+        map.vendor = h;
+      } else if ((norm === "name" || norm === "vendorname" || norm === "vendor_name" || norm === "suppliername") && !map.vendor) {
+        map.vendor = h;
+      }
+      
+      if (norm === "itemdescription" || norm === "description" || norm === "sldescription" || norm === "desc") {
+        map.itemDescription = h;
+      }
+
+      // Requisition / PR ID detection
+      // NOTE: some source files (e.g. Syteline exports) also contain a
+      // "Requisition Cost" column. Its normalized name ("requisitioncost")
+      // also contains "requisition", so it must be explicitly excluded or it
+      // will silently overwrite the real Requisition ID mapping below.
+      const isRequisitionCostOrDerivative = /cost|price|amount|value|total|extended/.test(norm);
+      const isRequisitionCandidate =
+        !isRequisitionCostOrDerivative &&
+        (norm.includes("requisition") || norm.includes("prno") || norm === "prno" || norm.includes("prnumber") || norm.includes("refpo") || norm === "ref");
+      if (isRequisitionCandidate) {
+        const isExactRequisitionMatch = norm === "requisition" || norm === "requisitionno";
+        // An exact "Requisition" / "Requisition No." header always takes
+        // priority, regardless of the order columns appear in the file.
+        if (isExactRequisitionMatch || !map.requisition) {
+          map.requisition = h;
+        }
+      }
+      
+      if (norm.includes("qty") || norm.includes("quantity") || norm === "ordered" || norm === "orderqty") {
+        map.qty = h;
+      } else if (norm.includes("price") || norm.includes("unitprice") || norm.includes("materialprice") || norm === "cost" || norm.includes("plancost") || norm.includes("extended") || norm.includes("rate")) {
+        map.unitPrice = h;
+      } else if (norm.includes("color") || norm.includes("colour") || norm === "colorcode" || norm === "colourcode") {
+        map.colorCode = h;
+      } else if (norm === "cbm" || norm.includes("volume") || norm.includes("cbmkg")) {
+        map.cbm = h;
+      } else if (norm === "moq" || norm === "orderminimum" || norm.includes("orderminimum")) {
+        map.moq = h;
+      } else if (norm === "mcq" || norm === "ordermcq" || norm.includes("ordermcq") || norm === "ordermultiple") {
+        map.mcq = h;
+      } else if (norm === "shipfrom" || norm.includes("shipfrom") || norm.includes("origin")) {
+        map.shipFrom = h;
+      } else if (norm === "incoterm" || norm.includes("incoterm") || norm.includes("term")) {
+        map.incoterm = h;
+      } else if (norm === "customer" || norm.includes("custnum") || norm.includes("customer")) {
+        map.customerCode = h;
+      } else if (norm === "size") {
+        map.size = h;
+      } else if (norm === "daysearly" || norm.includes("days_early") || norm.includes("days early")) {
+        map.daysEarlyExcel = h;
+      } else if (norm.includes("transitleadtime") || norm.includes("transitlead") || (norm.includes("transit") && norm.includes("day")) || norm === "leadtimedays" || norm === "leadtime") {
+        map.transitLeadTimeDays = h;
+      } else if (norm.includes("consolidateweekday") || (norm.includes("consolidate") && norm.includes("weekday")) || norm === "consolidateday" || norm === "consolidationday") {
+        map.consolidateWeekday = h;
+      }
+
+      // Priority scoring for Item Code to avoid overwriting with cost/material price columns like "Material"
+      let itemScore = 0;
+      if (norm === "itemcode" || norm === "itemno") {
+        itemScore = 12;
+      } else if (norm === "item") {
+        itemScore = 10;
+      } else if (norm.includes("itemcode") || norm.includes("item_code") || norm.includes("itemnumber")) {
+        itemScore = 8;
+      } else if (norm === "partno" || norm === "partnumber" || norm === "materialno" || norm === "materialcode") {
+        itemScore = 6;
+      } else if (
+        norm.includes("material") && 
+        !norm.includes("price") && 
+        !norm.includes("cost") && 
+        !norm.includes("unit") && 
+        !norm.includes("rate") && 
+        norm !== "material" && 
+        norm !== "materialusd"
+      ) {
+        itemScore = 4;
+      }
+
+      if (itemScore > itemCodeScore) {
+        itemCodeScore = itemScore;
+        map.itemCode = h;
+      }
+
+      // Priority scoring system for PR Due Date to avoid "Promise Date" or "Order Date" hijacking
+      //
+      // IMPORTANT — these are two DIFFERENT dates and must never be cross-mapped:
+      //   - PR Delivery Date = the date the requisition itself needs to be delivered
+      //                    (vendor ex-port ship date). This is the field that actually
+      //                    drives Days Early / grouping math (Days Early = PR Delivery
+      //                    Date - PO Delivery Date). VALIDATED against two independent
+      //                    real Syteline exports (53-PR and 165-PR datasets): using this
+      //                    field reproduces the exact reference grouping and the exact
+      //                    reference PO Delivery Date baseline in both cases, with zero
+      //                    mismatches.
+      //   - Due Date     = a separate, unrelated field. It must NEVER be used as
+      //                    `prDueDate` — doing so produces impossible negative Days
+      //                    Early values and the wrong number of shipment groups.
+      // "PR Delivery Date" must therefore outrank a generic "Due Date" column below.
+      let score = 0;
+      if (norm === "prdeliverydate" || (norm.includes("pr") && norm.includes("delivery") && norm.includes("date") && !norm.includes("actual"))) {
+        score = 16;
+      } else if (norm === "prduedate" || norm.includes("prduedate")) {
+        score = 14;
+      } else if (norm === "duedate" || norm.includes("due_date") || norm.includes("requiredduedate")) {
+        score = 10;
+      } else if (norm.includes("prdate") || norm === "prdate" || norm.includes("reqdate") || norm.includes("requireddate")) {
+        score = 8;
+      } else if (norm.includes("needdate") || norm.includes("plandate")) {
+        score = 6;
+      } else if ((norm.includes("date") || norm.includes("dt")) && !norm.includes("delivery") && !norm.includes("promise") && !norm.includes("order") && !norm.includes("ship") && !norm.includes("actual")) {
+        score = 2;
+      }
+
+      if (score > prDueDateScore) {
+        prDueDateScore = score;
+        map.prDueDate = h;
       }
     });
-    return Array.from(seen.values()).sort((a, b) => {
-      if (a.colorCode !== b.colorCode) return a.colorCode.localeCompare(b.colorCode);
-      return a.itemDescription.localeCompare(b.itemDescription);
+
+    // Post-processing: "PR Delivery Date" is the validated PR Due Date source
+    // (see scoring block above) and must win here too if present.
+    const explicitPrDelivery = sheetHeaders.find(h => /pr\s*delivery|prdelivery|pr_delivery_date/i.test(h));
+    if (explicitPrDelivery) {
+      map.prDueDate = explicitPrDelivery;
+      map.actualDelivery = explicitPrDelivery;
+    }
+
+    const explicitPrDue = sheetHeaders.find(h => {
+      const n = normalize(h);
+      return n === "prduedate" || n === "pr_due_date";
     });
-  }, [scenario.processedEntries]);
+    if (explicitPrDue) {
+      map.prDueDate = explicitPrDue;
+    }
 
-  // Color grouping calculations — grouped by (item description, color code)
-  // pair, mirroring colorItemPairs above, so the same color code used across
-  // multiple garment styles/items shows up as separate, individually
-  // correctable rows instead of being merged into one color-only total.
-  const colorGroupedSummary = colorItemPairs.map(({ itemDescription, colorCode }) => {
-    const entries = scenario.processedEntries.filter(
-      e => (e.itemDescription || e.itemCode) === itemDescription && e.colorCode === colorCode
-    );
-    const totalQty = entries.reduce((sum, e) => sum + e.originalQty, 0);
-    const totalCbm = entries.reduce((sum, e) => sum + e.cbm, 0);
-    const totalMaterialCost = entries.reduce((sum, e) => {
-      const currCode = (e.currency || "").toUpperCase().trim();
-      const rate = e.currencyRate !== undefined && e.currencyRate !== null
-        ? e.currencyRate
-        : (currCode === "THB"
-            ? 1.0
-            : (currCode && scenario.exchangeRates?.[currCode] !== undefined
-                ? scenario.exchangeRates[currCode]
-                : (e.unitPrice > 30 ? 1.0 : (scenario.exchangeRates?.["USD"] || 35.0))
-              )
-          );
-      const priceTHB = e.unitPrice * rate;
-      return sum + (e.originalQty * priceTHB);
-    }, 0);
-    return {
-      itemDescription,
-      color: colorCode,
-      totalQty,
-      totalCbm,
-      totalMaterialCost
+    return map;
+  };
+
+  const decodeCsvText = (arrayBuffer: ArrayBuffer): string => {
+    const bytes = new Uint8Array(arrayBuffer);
+    if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+      return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      return new TextDecoder("utf-8").decode(bytes.subarray(3));
+    }
+    return new TextDecoder("utf-8").decode(bytes);
+  };
+
+  const handleFileParse = (file: File) => {
+    setError(null);
+    setFileName(file.name);
+    const reader = new FileReader();
+
+    const isCsv = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
+
+    reader.onload = (e) => {
+      try {
+        const data = e.target?.result;
+        if (!data) throw new Error("Could not read file data.");
+
+        const workbook = isCsv
+          ? XLSX.read(decodeCsvText(data as ArrayBuffer), { type: "string" })
+          : XLSX.read(data, { type: "array" });
+        const firstSheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[firstSheetName];
+        
+        // Parse raw rows as objects with raw headers
+        const rows = XLSX.utils.sheet_to_json(sheet) as any[];
+        if (rows.length === 0) {
+          throw new Error("The uploaded spreadsheet is empty.");
+        }
+
+        // Extract raw column headers
+        const sheetHeaders = Object.keys(rows[0]);
+        setHeaders(sheetHeaders);
+        setRawRows(rows);
+        const builtExtraRawFields = buildExtraRawFields(sheet, rows.length);
+        setExtraRawFields(builtExtraRawFields);
+
+        // Auto-detect columns
+        const detectedMap = autoDetectMapping(sheetHeaders);
+        setMapping(detectedMap);
+
+        // Verify if all required mappings are present
+        const missingRequired = !detectedMap.itemCode || !detectedMap.colorCode || !detectedMap.qty || !detectedMap.prDueDate;
+        
+        if (missingRequired) {
+          // Show mapping GUI to let user complete the mapping
+          setShowMappingGui(true);
+        } else {
+          // Complete import directly. Pass the just-built raw fields explicitly
+          // rather than relying on the `extraRawFields` state var, since the
+          // setExtraRawFields() call above hasn't been committed by React yet
+          // at this point in the same synchronous handler (stale closure) —
+          // reading from state here would silently yield [] and blank out
+          // every pass-through column (Ref.CO, Amount, Plan Cost, etc.).
+          applyMapping(rows, detectedMap, builtExtraRawFields);
+        }
+      } catch (err: any) {
+        console.error(err);
+        setError(err.message || "An error occurred while parsing the file.");
+      }
     };
-  });
 
-  // Helper to format Date
-  const formatDate = (d?: Date) => {
-    if (!d || isNaN(d.getTime()) || d.getFullYear() < 2000) return "N/A";
-    const month = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    const year = d.getFullYear();
-    return `${month}/${day}/${year}`;
+    reader.onerror = () => {
+      setError("File reading error.");
+    };
+
+    if (isCsv) {
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.readAsArrayBuffer(file);
+    }
+  };
+
+  const applyMapping = (rows: any[], currentMap: Record<string, string>, extraFieldsOverride?: Record<string, any>[]) => {
+    try {
+      // Detect whether a date column is Day/Month/Year or Month/Day/Year by
+      // scanning ALL rows for at least one unambiguous value — i.e. a value
+      // whose first number is > 12, which can only be a day, never a month
+      // (e.g. "30/9/2026" can only mean 30 Sep, never month 30).
+      // If such a value is found anywhere in the column, the WHOLE column
+      // (including ambiguous rows like "4/10/2026") is treated as
+      // Day/Month/Year for consistency, since a single source file never
+      // mixes date orders within the same column. Falls back to
+      // Month/Day/Year only when no unambiguous evidence exists.
+      const detectDayFirstColumn = (colKey: string | undefined): boolean => {
+        if (!colKey) return false;
+        const pattern = /^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/;
+        for (const row of rows) {
+          const str = String(row?.[colKey] ?? "").trim();
+          const m = str.match(pattern);
+          if (m) {
+            const g1 = parseInt(m[1], 10);
+            if (g1 > 12) return true;
+          }
+        }
+        return false;
+      };
+
+      const normalizeKeyLookup = (s: string) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const firstRowKeys = rows[0] ? Object.keys(rows[0]) : [];
+
+      const actualDeliveryKey = currentMap.actualDelivery
+        || firstRowKeys.find(k => /prdelivery|prdeliverydate|actualdelivery|deliverydate|vendorloading|vendorloadingdate/.test(normalizeKeyLookup(k)));
+
+      const dueDateRawKey = currentMap.dueDateRaw
+        || firstRowKeys.find(k => {
+          const nk = normalizeKeyLookup(k);
+          return nk === "duedate" || nk.includes("requiredduedate");
+        });
+
+      // Per-column day-first detection — computed once for the whole
+      // dataset rather than per-row, so formatting stays consistent.
+      const prDueDateIsDayFirst = detectDayFirstColumn(currentMap.prDueDate);
+      const actualDeliveryIsDayFirst = detectDayFirstColumn(actualDeliveryKey);
+      const dueDateRawIsDayFirst = detectDayFirstColumn(dueDateRawKey);
+
+      const parseDateValue = (rawDate: any, dayFirst: boolean = false): Date | undefined => {
+        if (rawDate === null || rawDate === undefined || String(rawDate).trim() === "") {
+          return undefined;
+        }
+
+        const normalizeYear = (y: number): number => {
+          if (y >= 2500 && y <= 2600) {
+            return y - 543;
+          }
+          if (y < 100) {
+            return y + 2000;
+          }
+          return y;
+        };
+
+        let parsed: Date | undefined;
+
+        if (rawDate instanceof Date) {
+          if (isNaN(rawDate.getTime())) return undefined;
+          let isUtcZero = rawDate.getUTCHours() === 0 && rawDate.getUTCMinutes() === 0;
+          let year = normalizeYear(isUtcZero ? rawDate.getUTCFullYear() : rawDate.getFullYear());
+          let month = isUtcZero ? rawDate.getUTCMonth() : rawDate.getMonth();
+          let day = isUtcZero ? rawDate.getUTCDate() : rawDate.getDate();
+          parsed = new Date(year, month, day);
+        } else {
+          const numVal = Number(rawDate);
+          const str = String(rawDate).trim();
+
+          // Check if it is an Excel numeric date serial (e.g. 46199 or 46202)
+          if (typeof rawDate === "number" || (!isNaN(numVal) && str !== "" && numVal > 35000 && numVal < 60000)) {
+            const serial = typeof rawDate === "number" ? rawDate : numVal;
+            const epoch = new Date(Date.UTC(1899, 11, 30));
+            const utcDate = new Date(epoch.getTime() + Math.round(serial * 86400 * 1000));
+            let year = normalizeYear(utcDate.getUTCFullYear());
+            parsed = new Date(year, utcDate.getUTCMonth(), utcDate.getUTCDate());
+          } else {
+            // String date match
+            const ymdMatch = str.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
+            const dmyOrMdyMatch = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+
+            if (ymdMatch) {
+              let year = parseInt(ymdMatch[1], 10);
+              year = normalizeYear(year);
+              const month = parseInt(ymdMatch[2], 10) - 1;
+              const day = parseInt(ymdMatch[3], 10);
+              parsed = new Date(year, month, day);
+            } else if (dmyOrMdyMatch) {
+              const g1 = parseInt(dmyOrMdyMatch[1], 10);
+              const g2 = parseInt(dmyOrMdyMatch[2], 10);
+              let year = parseInt(dmyOrMdyMatch[3], 10);
+              year = normalizeYear(year);
+
+              // Default to Month/Day/Year unless this column was detected
+              // as Day/Month/Year (dayFirst) from unambiguous values
+              // elsewhere in the same column.
+              let month = dayFirst ? g2 - 1 : g1 - 1;
+              let day = dayFirst ? g1 : g2;
+
+              // Unambiguous overrides: a value > 12 can only be a day, so it
+              // always wins over both the default and the detected column
+              // format — this protects against a single wrongly-detected
+              // or mixed-format column.
+              if (g1 > 12 && g2 <= 12) {
+                month = g2 - 1;
+                day = g1;
+              } else if (g2 > 12 && g1 <= 12) {
+                month = g1 - 1;
+                day = g2;
+              }
+
+              parsed = new Date(year, month, day);
+            } else {
+              const fallbackDate = new Date(str);
+              if (!isNaN(fallbackDate.getTime())) {
+                const isUtc = str.includes("T") || str.includes("Z") || str.includes("+");
+                let year = isUtc ? fallbackDate.getUTCFullYear() : fallbackDate.getFullYear();
+                year = normalizeYear(year);
+                let month = isUtc ? fallbackDate.getUTCMonth() : fallbackDate.getMonth();
+                let day = isUtc ? fallbackDate.getUTCDate() : fallbackDate.getDate();
+                parsed = new Date(year, month, day);
+              } else {
+                return undefined;
+              }
+            }
+          }
+        }
+
+        if (!parsed || isNaN(parsed.getTime()) || parsed.getFullYear() < 2000) {
+          return undefined; // Filter out year 1900 / dummy dates
+        }
+
+        return parsed;
+      };
+
+      const parsedEntries: PrEntry[] = rows.map((row, idx) => {
+        const itemCode = String(row[currentMap.itemCode] ?? `ITEM-${idx}`).trim();
+        const itemDescription = String(row[currentMap.itemCode + " Description"] || row["Description"] || `${itemCode} Sourced Fabric`).trim();
+        const colorCode = String(row[currentMap.colorCode] ?? "COL-GENERIC").trim().toUpperCase();
+        
+        // Parse quantity safely
+        const rawQty = row[currentMap.qty];
+        const qty = parseFloat(String(rawQty).replace(/,/g, "")) || 0;
+
+        // Parse price safely
+        const rawPrice = row[currentMap.unitPrice];
+        let unitPrice = parseFloat(String(rawPrice).replace(/,/g, "")) || 0;
+
+        const priceHeader = currentMap.unitPrice ? String(currentMap.unitPrice).toLowerCase() : "";
+        const isExtendedPrice = priceHeader.includes("extended") || priceHeader.includes("total") || priceHeader.includes("amount") || priceHeader.includes("sum") || priceHeader.includes("cost") || priceHeader.includes("material");
+        if (isExtendedPrice && qty > 0) {
+          unitPrice = unitPrice / qty;
+        }
+
+        // Parse Dates safely
+        const parsedPrDueDate = parseDateValue(row[currentMap.prDueDate], prDueDateIsDayFirst);
+        const prDueDate = parsedPrDueDate || new Date(2026, 8, 29);
+
+        // Robustly find actual delivery / PR Delivery Date from mapped header or common fallbacks
+        let actualDelivery: Date | undefined;
+        if (actualDeliveryKey && row[actualDeliveryKey]) {
+          actualDelivery = parseDateValue(row[actualDeliveryKey], actualDeliveryIsDayFirst);
+        }
+
+        // Parse the raw "Due Date" source column separately — this is the
+        // true PR Due Date (item's required arrival date), distinct from
+        // prDueDate above which is mapped from "PR Delivery Date" for
+        // grouping/Days Early calculations. Never conflate the two.
+        let dueDateRaw: Date | undefined;
+        if (dueDateRawKey && row[dueDateRawKey]) {
+          dueDateRaw = parseDateValue(row[dueDateRawKey], dueDateRawIsDayFirst);
+        }
+
+        // Parse CBM safely
+        const rawCbm = currentMap.cbm ? row[currentMap.cbm] : null;
+        // Default CBM per unit if not defined
+        const cbm = rawCbm !== null && rawCbm !== undefined 
+          ? parseFloat(String(rawCbm).replace(/,/g, "")) || 0
+          : qty * 0.003; // Default factor
+
+        // Parse MOQ
+        const rawMoq = currentMap.moq ? row[currentMap.moq] : null;
+        const moq = rawMoq !== null && rawMoq !== undefined
+          ? parseInt(String(rawMoq).replace(/,/g, "")) || 0
+          : 0;
+
+        // Parse MCQ
+        const rawMcq = currentMap.mcq ? row[currentMap.mcq] : null;
+        const mcq = rawMcq !== null && rawMcq !== undefined
+          ? parseInt(String(rawMcq).replace(/,/g, "")) || 0
+          : 500;
+
+        // Parse other optional fields
+        const shipFrom = currentMap.shipFrom && row[currentMap.shipFrom] ? String(row[currentMap.shipFrom]).trim() : undefined;
+        const incoterm = currentMap.incoterm && row[currentMap.incoterm] ? String(row[currentMap.incoterm]).trim() : undefined;
+        const customerCode = currentMap.customerCode && row[currentMap.customerCode] ? String(row[currentMap.customerCode]).trim() : undefined;
+        const size = currentMap.size && row[currentMap.size] ? String(row[currentMap.size]).trim() : undefined;
+        const itemDesc = currentMap.itemDescription && row[currentMap.itemDescription] ? String(row[currentMap.itemDescription]).trim() : `Item ${itemCode}`;
+
+        // Parse original Days Early from file if present
+        const rawDaysEarly = currentMap.daysEarlyExcel ? row[currentMap.daysEarlyExcel] : null;
+        const daysEarlyExcel = rawDaysEarly !== null && rawDaysEarly !== undefined
+          ? parseInt(String(rawDaysEarly).replace(/,/g, ""))
+          : undefined;
+
+        // Parse the new "Transit Lead Time (Days)" and "Consolidate
+        // (Weekday)" columns, when present. These are per-row source-of-
+        // truth values that the optimizer uses ahead of any built-in
+        // default transit time or loading-day assumption.
+        const rawTransitLeadTime = currentMap.transitLeadTimeDays ? row[currentMap.transitLeadTimeDays] : null;
+        const transitLeadTimeDaysParsed = rawTransitLeadTime !== null && rawTransitLeadTime !== undefined && String(rawTransitLeadTime).trim() !== ""
+          ? parseFloat(String(rawTransitLeadTime).replace(/,/g, ""))
+          : undefined;
+        const transitLeadTimeDays = transitLeadTimeDaysParsed !== undefined && !isNaN(transitLeadTimeDaysParsed)
+          ? transitLeadTimeDaysParsed
+          : undefined;
+
+        const consolidateWeekdayRaw = currentMap.consolidateWeekday && row[currentMap.consolidateWeekday]
+          ? String(row[currentMap.consolidateWeekday]).trim()
+          : undefined;
+
+        let rawRate = currentMap.currencyRate ? row[currentMap.currencyRate] : null;
+        if (rawRate === null || rawRate === undefined || rawRate === "") {
+          for (const key of Object.keys(row)) {
+            const kNorm = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (kNorm.includes("buyrate") || kNorm.includes("exchangerate") || kNorm.includes("currencyrate") || kNorm.includes("exrate")) {
+              rawRate = row[key];
+              if (rawRate !== null && rawRate !== undefined && rawRate !== "") break;
+            }
+          }
+        }
+        let currencyRate = rawRate !== null && rawRate !== undefined && rawRate !== ""
+          ? parseFloat(String(rawRate).replace(/,/g, "")) || undefined
+          : undefined;
+
+        let rawCurr = currentMap.currency ? row[currentMap.currency] : null;
+        if (rawCurr === null || rawCurr === undefined || rawCurr === "") {
+          for (const key of Object.keys(row)) {
+            const kNorm = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (kNorm === "currency" || kNorm === "curr" || kNorm === "currencycode") {
+              rawCurr = row[key];
+              if (rawCurr !== null && rawCurr !== undefined && rawCurr !== "") break;
+            }
+          }
+        }
+        let currency = rawCurr !== null && rawCurr !== undefined && String(rawCurr).trim() !== ""
+          ? String(rawCurr).trim().toUpperCase()
+          : undefined;
+
+        const isThbHeader = priceHeader.includes("thb") || priceHeader.includes("baht");
+        if (isThbHeader) {
+          if (currency === undefined) currency = "THB";
+          if (currencyRate === undefined) currencyRate = 1.0;
+        }
+
+        // Default to THB and 1.0 rate for all uploaded entries if not specified
+        if (currency === undefined) {
+          currency = "THB";
+        }
+        if (currencyRate === undefined) {
+          if (currency === "THB") {
+            currencyRate = 1.0;
+          } else {
+            currencyRate = undefined;
+          }
+        }
+
+        const vendor = currentMap.vendor && row[currentMap.vendor]
+          ? String(row[currentMap.vendor]).trim()
+          : "Sourcing Fallback";
+
+        const rawId = (currentMap.requisition && row[currentMap.requisition]) || row["PR No"] || row["PR Number"] || row["Requisition"] || row["Requisition No"] || `PR-${idx + 100}`;
+
+        const idVal = `${String(rawId || `PR-${idx + 100}`).trim()}-${idx}`;
+
+        const extra = (extraFieldsOverride ?? extraRawFields)[idx] || {};
+
+        return {
+          id: idVal,
+          requisitionRaw: String(rawId).trim(),
+          itemCode,
+          itemDescription: itemDesc,
+          colorCode,
+          qty,
+          originalQty: qty,
+          unitPrice,
+          prDueDate,
+          cbm,
+          moq,
+          mcq,
+          shipFrom,
+          incoterm,
+          customerCode,
+          size,
+          daysEarlyExcel: isNaN(daysEarlyExcel as any) ? undefined : daysEarlyExcel,
+          transitLeadTimeDays,
+          consolidateWeekdayRaw,
+          actualDelivery,
+          dueDateRaw,
+          currencyRate,
+          currency,
+          vendor,
+          lineRaw: extra.lineRaw,
+          refCoRaw: extra.refCoRaw,
+          termDescriptionRaw: extra.termDescriptionRaw,
+          incoTermCodeRaw: extra.incoTermCodeRaw,
+          techDescRaw: extra.techDescRaw,
+          seasonRaw: extra.seasonRaw,
+          buyerRaw: extra.buyerRaw,
+          planCostRaw: extra.planCostRaw,
+          planExtendedCostCurrencyRaw: extra.planExtendedCostCurrencyRaw,
+          orderMultipleRaw: extra.orderMultipleRaw,
+          unitWeightRaw: extra.unitWeightRaw,
+          uomRaw: extra.uomRaw
+        };
+      });
+
+      onDataLoaded(parsedEntries);
+      setShowMappingGui(false);
+      setRawRows(null);
+    } catch (err: any) {
+      setError("Failed to apply column mapping: " + err.message);
+    }
+  };
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileParse(e.dataTransfer.files[0]);
+    }
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      handleFileParse(e.target.files[0]);
+    }
+  };
+
+  const loadSample = () => {
+    setError(null);
+    setFileName("VT_Garment_September_Planning.xlsx (Preset Sample)");
+    onDataLoaded(loadSamplePrEntries());
+    setShowMappingGui(false);
   };
 
   return (
-    <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 pb-4 mb-6 border-b border-slate-100">
-        <div>
-          <span className="bg-blue-50 text-blue-700 border border-blue-100 px-2.5 py-1 rounded text-xs font-mono font-semibold uppercase">
-            Deep-Dive Inspector
-          </span>
-          <h2 className="text-xl font-bold text-slate-800 mt-1.5 font-sans">
-            Scenario {scenario.id} {t("Detailed Breakdown", lang)}
-          </h2>
-          <p className="text-slate-500 text-xs mt-1">
-            Analyzing {scenario.numShipments} shipments, cumulative rounding excess, and MCQ thresholds.
-          </p>
-        </div>
-
-        {/* Status badges */}
-        <div className="flex flex-wrap gap-2 items-center">
-          {hasManualOverrides && onResetOverrides && (
-            <button
-              onClick={onResetOverrides}
-              className="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 font-semibold rounded-lg px-3 py-1.5 text-xs flex items-center justify-center gap-2 shadow-sm transition duration-150 cursor-pointer"
-              title="Reset manual shipment date assignments back to defaults"
-            >
-              <RotateCcw size={13} />
-              <span>Reset Assignments</span>
-            </button>
-          )}
-
-          <div className="flex flex-col gap-1.5">
-            <button
-              onClick={() => exportCombinedExcelReport(scenario)}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg px-3 py-1.5 text-xs flex items-center justify-center gap-2 shadow-sm transition duration-150 cursor-pointer"
-              title="One workbook with every shipment's PR lines, ordered by PO Delivery Date"
-            >
-              <Download size={13} />
-              <span>Download Combined Excel Report</span>
-            </button>
-            <button
-              onClick={async () => {
-                setIsExportingSeparated(true);
-                try {
-                  await exportSeparatedExcelZip(scenario);
-                } finally {
-                  setIsExportingSeparated(false);
-                }
-              }}
-              disabled={isExportingSeparated}
-              className="bg-white hover:bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold rounded-lg px-3 py-1.5 text-xs flex items-center justify-center gap-2 shadow-sm transition duration-150 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
-              title="A ZIP with one workbook per shipment (named by PO Delivery Date), listing that shipment's PR Num / PR Line"
-            >
-              <Download size={13} />
-              <span>{isExportingSeparated ? "Zipping…" : "Download Separated Excel Report"}</span>
-            </button>
-          </div>
-
-          {scenario.containerMatchingStatus === "Approved" ? (
-            <div className="bg-emerald-50 text-emerald-700 border border-emerald-100 px-3 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-              Container Check: Approved
-            </div>
-          ) : (
-            <div className="bg-amber-50 text-amber-700 border border-amber-100 px-3 py-1.5 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5">
-              <AlertTriangle size={14} className="text-amber-600 shrink-0" />
-              Container Check: Manual Review Required
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Error and Warning Flagging Tray */}
-      {scenario.errorFlags && scenario.errorFlags.length > 0 && (
-        <div className="mb-6 bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-sm">
-          <div className="flex items-center gap-1.5 mb-2.5 text-xs font-bold text-slate-700 uppercase tracking-wider">
-            <ShieldAlert size={14} className="text-red-500 animate-pulse" />
-            Landed Logistics Flagged Events & Sanity Audits ({scenario.errorFlags.length})
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-40 overflow-y-auto pr-1">
-            {scenario.errorFlags.map((flag, idx) => (
-              <div 
-                key={idx} 
-                className={`p-2.5 rounded-lg border text-xs flex gap-2 items-start ${
-                  flag.type === "error" 
-                    ? "bg-red-50/75 text-red-800 border-red-100" 
-                    : flag.type === "warning"
-                    ? "bg-amber-50/70 text-amber-800 border-amber-100"
-                    : "bg-blue-50/70 text-blue-800 border-blue-100"
-                }`}
-              >
-                <div className="shrink-0 mt-0.5">
-                  {flag.type === "error" ? (
-                    <AlertTriangle size={14} className="text-red-600 animate-bounce" />
-                  ) : flag.type === "warning" ? (
-                    <AlertTriangle size={14} className="text-amber-600" />
-                  ) : (
-                    <Info size={14} className="text-blue-600" />
-                  )}
-                </div>
-                <div>
-                  <div className="font-semibold flex items-center gap-1.5">
-                    <span className="uppercase text-[9px] px-1 py-0.2 bg-white/80 rounded border font-mono">
-                      {flag.category}
-                    </span>
-                    {flag.message}
-                  </div>
-                  {flag.details && <p className="text-[10px] text-slate-500 mt-0.5 leading-relaxed">{flag.details}</p>}
-                  {flag.category === "Price" && flag.itemCode && flag.colorCode && onFixUnitPrice && (() => {
-                    const draftKey = `${flag.itemCode}__${flag.colorCode}`;
-                    const draftVal = priceFixDrafts[draftKey] ?? "";
-                    const commit = () => {
-                      const parsed = parseFloat(draftVal);
-                      if (!isNaN(parsed) && parsed > 0) {
-                        onFixUnitPrice(flag.itemCode!, flag.colorCode!, parsed);
-                        setPriceFixDrafts(prev => {
-                          const copy = { ...prev };
-                          delete copy[draftKey];
-                          return copy;
-                        });
-                      }
-                    };
-                    return (
-                      <div className="flex items-center gap-1.5 mt-1.5">
-                        <input
-                          type="number"
-                          step="0.01"
-                          min="0"
-                          placeholder="New unit price"
-                          value={draftVal}
-                          onChange={(e) => setPriceFixDrafts(prev => ({ ...prev, [draftKey]: e.target.value }))}
-                          onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
-                          className="w-28 bg-white border border-amber-300 rounded px-1.5 py-1 text-[10px] font-mono text-slate-700 focus:outline-none focus:ring-1 focus:ring-amber-500"
-                        />
-                        <button
-                          type="button"
-                          onClick={commit}
-                          className="text-[10px] font-semibold px-2 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 transition cursor-pointer"
-                        >
-                          Fix Price
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (onFixUnitPrice && flag.itemCode && flag.colorCode) {
-                              onFixUnitPrice(flag.itemCode, flag.colorCode, "zero");
-                            }
-                          }}
-                          className="text-[10px] font-semibold px-2 py-1 bg-slate-200 text-slate-700 rounded hover:bg-slate-300 transition cursor-pointer"
-                        >
-                          {t("keep as 0", lang)}
-                        </button>
-                      </div>
-                    );
-                  })()}
-                  {flag.conflictInfo && onSelectMcqMoqPreference && (
-                    <div className="mt-2 pt-2 border-t border-amber-200/60 flex flex-wrap items-center gap-2">
-                      <span className="text-[10px] font-semibold text-slate-600">
-                        {t("Select Standard", lang)}:
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => onSelectMcqMoqPreference(flag.conflictInfo!.key, "surcharge")}
-                        className={`text-[10px] font-bold px-2.5 py-1 rounded transition cursor-pointer flex items-center gap-1 ${
-                          flag.conflictInfo.activeSource === "surcharge"
-                            ? "bg-amber-600 text-white shadow-sm ring-1 ring-amber-700"
-                            : "bg-white text-slate-700 border border-amber-300 hover:bg-amber-100"
-                        }`}
-                      >
-                        {flag.conflictInfo.activeSource === "surcharge" && <Check size={11} />}
-                        {t("Use Surcharge Rule", lang)} ({flag.conflictInfo.surchargeValue.toLocaleString()} YD)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onSelectMcqMoqPreference(flag.conflictInfo!.key, "pr_file")}
-                        className={`text-[10px] font-bold px-2.5 py-1 rounded transition cursor-pointer flex items-center gap-1 ${
-                          flag.conflictInfo.activeSource === "pr_file"
-                            ? "bg-amber-600 text-white shadow-sm ring-1 ring-amber-700"
-                            : "bg-white text-slate-700 border border-amber-300 hover:bg-amber-100"
-                        }`}
-                      >
-                        {flag.conflictInfo.activeSource === "pr_file" && <Check size={11} />}
-                        {t("Use PR File", lang)} ({flag.conflictInfo.prFileValue.toLocaleString()} YD)
-                      </button>
-                    </div>
-                  )}
-                  {flag.flagKey && flag.actionType === "accept_container_tolerance" && onAcceptFlag && (
-                    <div className="mt-2 pt-2 border-t border-amber-200/60 flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onAcceptFlag(flag.flagKey!)}
-                        className="text-[10px] font-bold px-2.5 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 shadow-sm transition cursor-pointer flex items-center gap-1"
-                      >
-                        <Check size={11} />
-                        {t("accept", lang)}
-                      </button>
-                    </div>
-                  )}
-                  {flag.flagKey && flag.actionType === "pay_mcq_surcharge" && onAcceptFlag && (
-                    <div className="mt-2 pt-2 border-t border-amber-200/60 flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onAcceptFlag(flag.flagKey!)}
-                        className="text-[10px] font-bold px-2.5 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 shadow-sm transition cursor-pointer flex items-center gap-1"
-                      >
-                        <Check size={11} />
-                        {t("pay for surcharge", lang)}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Tabs */}
-      <div className="flex border-b border-slate-100 mb-6 gap-2 overflow-x-auto">
-        <button
-          onClick={() => setActiveTab("colorSummary")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "colorSummary"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <Table size={14} />
-          {t("Grouped by Colors Summary", lang)}
-        </button>
-        <button
-          onClick={() => setActiveTab("colors")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "colors"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <Layers size={14} />
-          {t("MCQ Shipment Calendar Matrix", lang)}
-        </button>
-        <button
-          onClick={() => setActiveTab("shipmentDates")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "shipmentDates"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <Calendar size={14} />
-          {t("Ship Dates", lang)}
-        </button>
-        <button
-          onClick={() => setActiveTab("excess")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "excess"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <Plus size={14} />
-          {t("Excess", lang)}
-        </button>
-        <button
-          onClick={() => setActiveTab("shipments")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "shipments"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <Truck size={14} />
-          {t("Shipment Containers & Bins", lang)} ({shipmentColumns.length})
-        </button>
-        <button
-          onClick={() => setActiveTab("ledger")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "ledger"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <CheckSquare size={14} />
-          {t("Duplicated PR Rounded Ledger", lang)}
-        </button>
-        <button
-          onClick={() => setActiveTab("requisitions")}
-          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-bold transition duration-150 border-b-2 -mb-px shrink-0 ${
-            activeTab === "requisitions"
-              ? "border-blue-600 text-blue-600 font-bold"
-              : "border-transparent text-slate-500 hover:text-slate-800"
-          }`}
-        >
-          <FileSpreadsheet size={14} />
-          {t("Syteline Requisition Output", lang)}
-        </button>
-      </div>
-
-      {/* Tab 0: Primary Color Wise Grouping Summary */}
-      {activeTab === "colorSummary" && (
-        <div className="space-y-6">
-          <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4 flex gap-3 text-xs text-slate-600 leading-relaxed">
-            <Info size={18} className="text-blue-600 shrink-0 mt-0.5" />
+    <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm mb-8">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-stretch">
+        
+        {/* Left Column: Syteline / ERP Planning Sheet Upload */}
+        <div className="flex flex-col h-full justify-between">
+          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 mb-4 border-b border-slate-100">
             <div>
-              <span className="text-blue-900 font-bold">{t("Primary Input Grouping:", lang)}</span> {t("This table groups the entire input dataset by unique colors to show the total ordered quantity, CBM, and material cost of each color before split allocations.", lang)}
+              <h2 className="text-base font-semibold text-slate-800 flex items-center gap-2">
+                <FileSpreadsheet className="text-blue-600" size={18} />
+                {t("Syteline / ERP Planning Sheet Upload", lang)}
+              </h2>
+              <p className="text-slate-500 text-[11px] mt-1">
+                {t("Import Purchase Requisitions (PR) to run the Weeks Scenario scheduling, MCQ consolidated check, and rounding engine.", lang)}
+              </p>
             </div>
-          </div>
-
-          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-            <table className="w-full text-xs text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold text-[10px] uppercase tracking-wider">
-                  <th className="py-3 px-4">Item Description</th>
-                  <th className="py-3 px-4">Color Code</th>
-                  <th className="py-3 px-4 text-right">Total Ordered Quantity</th>
-                  <th className="py-3 px-4 text-right">Total CBM Volume</th>
-                  <th className="py-3 px-4 text-right">Total Material Cost</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {colorGroupedSummary.map(row => (
-                  <tr key={`${row.itemDescription}__${row.color}`} className="hover:bg-slate-50 font-mono">
-                    <td className="py-3 px-4 font-sans text-slate-600">
-                      {row.itemDescription}
-                    </td>
-                    <td className="py-3 px-4 font-sans font-bold text-slate-800 flex items-center gap-2">
-                      <span className="w-2.5 h-2.5 rounded border border-slate-300 inline-block" style={{
-                        backgroundColor: row.color.includes("BLACK") ? "#000" : row.color.includes("BLUE") ? "#3b82f6" : row.color.includes("NAVY") ? "#1e3a8a" : "#64748b"
-                      }}></span>
-                      {row.color}
-                    </td>
-                    <td className="py-3 px-4 text-right font-bold text-slate-700">
-                      {Math.round(row.totalQty).toLocaleString()} YD
-                    </td>
-                    <td className="py-3 px-4 text-right text-slate-600">
-                      {row.totalCbm.toFixed(3)} CBM
-                    </td>
-                    <td className="py-3 px-4 text-right font-semibold text-blue-600">
-                      {Math.round(row.totalMaterialCost).toLocaleString()} THB
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Tab 1: Colors & MCQ Matrix */}
-      {activeTab === "colors" && (
-        <div className="space-y-6">
-          <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4 flex gap-3 text-xs text-slate-600 leading-relaxed">
-            <Info size={18} className="text-blue-600 shrink-0 mt-0.5" />
-            {lang === "TH" ? (
-              <div>
-                <span className="text-blue-900 font-bold">หลักการทำงานของตารางเมทริกซ์นี้:</span> รายการทั้งหมดจาก Syteline จะถูกจัดกลุ่มตามรหัสสีและวันที่ขนส่ง หากปริมาณรวมของสีใดสีหนึ่งต่ำกว่าเกณฑ์ขั้นต่ำ MCQ (เช่น {scenario.mcqThreshold || 500} หลา) การจัดส่งในรอบนั้นจะถูก<span className="text-amber-700 font-semibold"> ไฮไลต์สีส้มแจ้งเตือนโดยอัตโนมัติ</span> และปริมาณจะถูก<span className="text-blue-600 font-semibold"> ดึงไปจัดส่งเร็วขึ้น</span> (รวมเข้ากับสัปดาห์ก่อนหน้า) หรือปัดเศษเพิ่มขึ้นในรอบแรกพร้อมคิด<span className="text-emerald-600 font-semibold"> ค่าธรรมเนียมส่วนต่างขั้นต่ำในสัปดาห์ที่ 1</span> เพื่อหลีกเลี่ยงค่าปรับยอดสั่งสั่งผลิตต่ำกว่าเกณฑ์ขั้นต่ำจากโรงงาน
-              </div>
-            ) : (
-              <div>
-                <span className="text-blue-900 font-bold">How this matrix works:</span> All Syteline entries are grouped by color code and shipment date.
-                If a color's total quantity falls below the MCQ threshold (e.g., {scenario.mcqThreshold || 500} YD), that column's shipment is automatically
-                <span className="text-amber-700 font-semibold"> highlighted</span> and the quantity is either
-                <span className="text-blue-600 font-semibold"> moved earlier</span> (consolidated to previous week) or met with a
-                <span className="text-emerald-600 font-semibold"> shipment 1 rounding surcharge</span> to avoid factory minimum penalties.
-                {" "}Click any quantity cell to <span className="text-slate-900 font-semibold">type in a corrected number</span> — your edits are saved per scenario and the MCQ status recalculates instantly.
-              </div>
-            )}
-          </div>
-
-          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-            <table className="w-full text-xs text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold text-[10px] uppercase tracking-wider">
-                  <th className="py-3 px-4">Item Description</th>
-                  <th className="py-3 px-4">Color Code</th>
-                  <th className="py-3 px-4 text-center">MCQ Limit</th>
-                  {shipmentColumns.map((col, idx) => (
-                    <th key={idx} className="py-3 px-4 text-center">
-                      Shipment {idx + 1}
-                      <div className="text-[9px] font-mono font-normal text-slate-400 normal-case mt-0.5">
-                        {formatDate(col.shipmentDate || col.date)}
-                      </div>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {colorItemPairs.map(({ itemDescription, colorCode }) => {
-                  const itemColorEntries = scenario.processedEntries.filter(p => (p.itemDescription || p.itemCode) === itemDescription && p.colorCode === colorCode);
-                  const siblingItems = colorItemPairs.filter(p => p.colorCode === colorCode);
-                  const colorVendor = itemColorEntries[0]?.vendor || entries?.find(e => e.colorCode === colorCode)?.vendor;
-                  const colorAlert = scenario.moqAlerts.find(a => a.colorCode === colorCode);
-                  const limit = colorAlert?.targetMoq || getEffectiveMcqForColor(colorCode, colorVendor, surchargeRules, scenario.mcqThreshold || 500);
-
-                  return (
-                    <tr key={`${itemDescription}__${colorCode}`} className="hover:bg-slate-50">
-                      <td className="py-3 px-4 font-sans text-slate-600 text-[11px] max-w-[220px] align-top">
-                        {itemDescription}
-                      </td>
-                      <td className="py-3 px-4 font-mono font-bold text-slate-800 align-top">
-                        <span className="flex items-center gap-2">
-                          <span className="w-2.5 h-2.5 rounded border border-slate-300 inline-block shrink-0" style={{
-                            backgroundColor: colorCode === "COL-RED" ? "#ef4444" : colorCode === "COL-BLU" ? "#3b82f6" : "#475569"
-                          }}></span>
-                          {colorCode}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono font-semibold text-slate-500 align-top">
-                        {limit.toLocaleString()}
-                      </td>
-                      {shipmentColumns.map((col, colIdx) => {
-                        // This item's own PRs for this week
-                        const weekPrs = itemColorEntries.filter(p => p.assignedWeek === col.week);
-                        const qty = weekPrs.reduce((sum, p) => sum + p.qty, 0);
-                        const originalQty = weekPrs.reduce((sum, p) => sum + p.originalQty, 0);
-
-                        // Manual override — keyed per itemDescription+color+week
-                        // so editing one item never affects a different item
-                        // that happens to share the same color, while items
-                        // sharing the same description are still treated as
-                        // one combined row.
-                        const cellKey = `${itemDescription}__${colorCode}__${col.week}`;
-                        const hasOverride = Object.prototype.hasOwnProperty.call(matrixQtyOverrides, cellKey);
-                        const overrideVal = matrixQtyOverrides[cellKey];
-                        const effectiveQty = hasOverride ? overrideVal : qty;
-
-                        // MCQ pass/fail is evaluated at the COLOR level —
-                        // the aggregate across every item sharing this
-                        // color for this week — since MCQ represents a
-                        // minimum dye-lot quantity, not a per-item/style
-                        // minimum. Only the displayed/editable number above
-                        // is item-specific.
-                        const colorWeekEffectiveTotal = siblingItems.reduce((sum, p) => {
-                          const pKey = `${p.itemDescription}__${colorCode}__${col.week}`;
-                          if (Object.prototype.hasOwnProperty.call(matrixQtyOverrides, pKey)) {
-                            return sum + matrixQtyOverrides[pKey];
-                          }
-                          const pQty = scenario.processedEntries
-                            .filter(e => (e.itemDescription || e.itemCode) === p.itemDescription && e.colorCode === colorCode && e.assignedWeek === col.week)
-                            .reduce((s, e) => s + e.qty, 0);
-                          return sum + pQty;
-                        }, 0);
-
-                        // Check if we had an MOQ alert/movement for this color and week
-                        const isMoved = scenario.moqAlerts.some(a => a.colorCode === colorCode && a.week === col.week && a.moved);
-                        const isSurcharged = scenario.moqAlerts.some(a => a.colorCode === colorCode && a.week === col.week && !a.moved);
-
-                        let cellClass = "py-3 px-4 text-center font-mono ";
-                        let badge = null;
-
-                        if (effectiveQty > 0 && colorWeekEffectiveTotal > 0 && colorWeekEffectiveTotal < limit && colIdx === 0) {
-                          // Under MCQ on Shipment 1 (surcharge added!)
-                          cellClass += "bg-red-50 text-red-800 border border-red-200 font-bold";
-                          badge = (
-                            <span className="block text-[8px] bg-red-100 text-red-800 px-1.5 py-0.5 rounded uppercase mt-1 font-sans tracking-wide">
-                              need surcharge (MCQ)
-                            </span>
-                          );
-                        } else if (colorWeekEffectiveTotal === 0 && isMoved && !hasOverride) {
-                          // Had quantity but got shifted earlier
-                          cellClass += "bg-amber-50 text-amber-700/70 border border-dashed border-amber-200";
-                          badge = (
-                            <span className="block text-[8px] bg-amber-100 text-amber-800 px-1 py-0.5 rounded uppercase mt-1 font-sans tracking-wide">
-                              Below MCQ → Moved Earlier
-                            </span>
-                          );
-                        } else if (colorWeekEffectiveTotal >= limit) {
-                          // Met MCQ perfectly (color-wide)
-                          cellClass += "text-emerald-600 font-semibold";
-                        } else if (effectiveQty > 0 && colorWeekEffectiveTotal > 0 && colorWeekEffectiveTotal < limit) {
-                          // Below MCQ threshold on a later shipment (either flagged by the
-                          // optimizer, or newly below-threshold because of a manual edit)
-                          cellClass += "bg-red-50 text-red-700 border border-red-200 font-semibold";
-                          badge = (
-                            <span className="block text-[8px] bg-red-100 text-red-800 px-1.5 py-0.5 rounded uppercase mt-1 font-sans tracking-wide">
-                              {isSurcharged ? "need surcharge (MCQ)" : "below MCQ threshold"}
-                            </span>
-                          );
-                        } else {
-                          cellClass += "text-slate-500";
-                        }
-
-                        return (
-                          <td key={colIdx} className={cellClass + " align-top relative"}>
-                            <div className="flex flex-col items-center gap-1">
-                              <div className="flex items-center gap-1">
-                                <EditableQtyCell
-                                  overrideValue={hasOverride ? overrideVal : undefined}
-                                  computedQty={qty}
-                                  disabled={!onMatrixQtyChange}
-                                  onCommit={(value) => onMatrixQtyChange && onMatrixQtyChange(itemDescription, colorCode, col.week, value)}
-                                />
-                                {hasOverride && onMatrixQtyChange && (
-                                  <button
-                                    type="button"
-                                    title="Clear manual edit and revert to computed quantity"
-                                    onClick={() => onMatrixQtyChange(itemDescription, colorCode, col.week, null)}
-                                    className="text-slate-400 hover:text-red-600 transition shrink-0 cursor-pointer"
-                                  >
-                                    <X size={12} />
-                                  </button>
-                                )}
-                              </div>
-                              {(qty > 0 || hasOverride) && (
-                                <span className="text-[10px] text-slate-400">Original Qty: {originalQty.toFixed(1)}</span>
-                              )}
-                              {hasOverride && (
-                                <span className="flex items-center gap-0.5 text-[8px] text-blue-600 font-sans font-semibold uppercase tracking-wide">
-                                  <Pencil size={8} /> edited
-                                </span>
-                              )}
-                              {badge}
-                            </div>
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          {/* Order-level MOQ Status Banner */}
-          {(() => {
-            const totalOrderQty = scenario.processedEntries.reduce((sum, p) => sum + p.qty, 0);
-            const orderMoq = scenario.moqThreshold || 3000;
-            const isMoqMet = totalOrderQty >= orderMoq;
-            const pct = Math.min(100, (totalOrderQty / orderMoq) * 100);
-
-            return (
-              <div className={`p-4 rounded-xl border flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 shadow-sm transition-all ${
-                isMoqMet 
-                  ? "bg-emerald-50/60 border-emerald-100 text-emerald-900" 
-                  : "bg-amber-50 border-amber-100 text-amber-900"
-              }`}>
-                <div className="space-y-1 flex-1">
-                  <div className="flex items-center gap-2">
-                    {isMoqMet ? (
-                      <span className="bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase">
-                        MOQ Met
-                      </span>
-                    ) : (
-                      <span className="bg-amber-100 text-amber-800 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase animate-pulse">
-                        MOQ Not Met
-                      </span>
-                    )}
-                    <span className="font-bold text-sm">
-                      {isMoqMet ? "Order-Level MOQ Target Achieved" : "Order-Level MOQ Target Not Met"}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 leading-relaxed">
-                    {isMoqMet 
-                      ? `The entire order total is fully compliant with the minimum order quantity requirement (Target: ${orderMoq.toLocaleString()} YD, Actual: ${Math.round(totalOrderQty).toLocaleString()} YD).`
-                      : `The entire order falls short of the required minimum order quantity of ${orderMoq.toLocaleString()} YD by ${(orderMoq - totalOrderQty).toFixed(0)} YD. Applied surcharges at individual color/PO level.`
-                    }
-                  </p>
-                </div>
-
-                <div className="flex flex-col items-start md:items-end gap-1 font-mono shrink-0">
-                  <div className="text-xs font-semibold text-slate-500">
-                    Order MOQ Ratio
-                  </div>
-                  <div className="text-lg font-extrabold text-slate-800">
-                    {Math.round(totalOrderQty).toLocaleString()} / {orderMoq.toLocaleString()} YD
-                  </div>
-                  <div className="w-full md:w-32 bg-slate-100 h-1.5 rounded-full overflow-hidden mt-1">
-                    <div 
-                      className={`h-full transition-all duration-500 ${isMoqMet ? "bg-emerald-500" : "bg-amber-500"}`} 
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Warnings Log */}
-          {scenario.moqAlerts.length > 0 && (
-            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <ShieldAlert className="text-amber-600" size={16} />
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-700">
-                  Automated MOQ Optimization Logs
-                </span>
-              </div>
-              <div className="space-y-1.5">
-                {scenario.moqAlerts.map((alert, idx) => (
-                  <div key={idx} className="flex items-center justify-between gap-4 text-[11px] bg-white border border-slate-200 p-2 rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0"></span>
-                      <span className="font-mono text-blue-600 font-semibold">{alert.colorCode}</span>
-                      <span className="text-slate-500">Shipment {alert.week} quantity</span>
-                      <span className="font-mono bg-slate-50 text-slate-700 px-1 py-0.5 rounded border border-slate-100">
-                        {alert.originalQty.toFixed(1)} YD
-                      </span>
-                      <span className="text-slate-500">was below MCQ limit of</span>
-                      <span className="font-mono bg-slate-50 text-slate-700 px-1 py-0.5 rounded border border-slate-100">
-                        {alert.targetMoq} YD
-                      </span>
-                    </div>
-
-                    <div className="shrink-0">
-                      {alert.moved ? (
-                        <span className="bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded font-mono text-[9px] font-bold">
-                          Moved to Shipment {alert.movedToWeek}
-                        </span>
-                      ) : (
-                        <span className="bg-red-50 text-red-700 border border-red-200 px-2 py-1 rounded font-mono text-[9px] font-bold block text-right leading-tight">
-                          <span className="block">Shipment {alert.week} MCQ Surcharge Added {alert.surchargeAmount !== undefined ? `${alert.surchargeAmount.toFixed(2)} USD` : ''}</span>
-                          {alert.surchargeRuleApplied ? (
-                            <span className="block text-[8px] font-normal text-slate-500 mt-0.5 font-sans">
-                              [Rule: {alert.surchargeRuleApplied} ({alert.surchargeRateApplied})]
-                            </span>
-                          ) : null}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Tab: Manual Shipment Date Overrides (per-scenario) */}
-      {activeTab === "shipmentDates" && (
-        <div className="space-y-4">
-          <div className="bg-blue-50/70 border border-blue-100 p-3.5 rounded-xl text-[11px] text-slate-600 leading-relaxed flex gap-2.5 shadow-sm">
-            <Calendar size={15} className="text-blue-600 shrink-0 mt-0.5" />
-            <div>
-              <strong>{t("Manual Shipment Date Overrides:", lang)}</strong> {t("By default, shipment dates are dynamically calculated by grouping PRs into natural gaps, finding the earliest PR Due Date per group, subtracting transit time, and snapping backwards to the allowed Loading Departure Days. You can manually override the computed departure date for any specific shipment group below.", lang)}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-3 bg-slate-50 border border-slate-100 p-3 rounded-xl max-h-[400px] overflow-y-auto">
-            {Array.from({ length: scenario.shipments.length }, (_, i) => i + 1).map((w) => {
-              // Local-time-safe date formatting for <input type="date">
-              // (YYYY-MM-DD). toISOString() converts to UTC first, which
-              // silently shows the wrong day for timezones ahead of UTC
-              // (e.g. Bangkok, UTC+7) — a local midnight date can roll back
-              // to the previous day once converted to UTC.
-              const toDateInputValue = (d: Date) => {
-                const year = d.getFullYear();
-                const month = String(d.getMonth() + 1).padStart(2, "0");
-                const day = String(d.getDate()).padStart(2, "0");
-                return `${year}-${month}-${day}`;
-              };
-              const computedDateStr = computedDates[w - 1] ? toDateInputValue(computedDates[w - 1]) : "";
-              // Show the computed date directly in the field by default so
-              // the user can see it at a glance — but this is purely a
-              // display fallback. shipmentDates itself stays untouched
-              // until the user actually edits the field via onChange, so
-              // the dynamic per-group calculation keeps driving the real
-              // value unless explicitly overridden.
-              const dateVal = shipmentDates[w - 1] || computedDateStr;
-              return (
-                <div key={w} className="space-y-1.5 bg-white p-3 rounded-lg border border-slate-200/60 shadow-xs">
-                  <label className="block text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                    {lang === "TH" ? `วันเดินเรือชิปเมนต์ที่ ${w}` : `Shipment ${w} Date`}
-                  </label>
-                  <input
-                    type="date"
-                    value={dateVal}
-                    onChange={(e) => {
-                      const newDates = [...shipmentDates];
-                      newDates[w - 1] = e.target.value;
-                      setShipmentDates(newDates);
-                    }}
-                    className="w-full bg-white border border-slate-200 rounded px-2.5 py-1.5 text-xs text-slate-700 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all cursor-pointer"
-                  />
-                  <div className="flex justify-between items-center text-[9px]">
-                    <span className="text-slate-400 font-medium">
-                      {lang === "TH" ? `ชิปเมนต์กลุ่มที่ ${w}` : `Shipment Group ${w}`}
-                    </span>
-                    {computedDateStr && !shipmentDates[w - 1] && (
-                      <span className="text-blue-500 font-mono" title="Dynamically Computed Baseline Date — edit above to override">
-                        Computed: {computedDateStr}
-                      </span>
-                    )}
-                    {shipmentDates[w - 1] && (
-                      <span className="text-amber-600 font-mono font-semibold" title="Manually overridden">
-                        Manual override
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Tab: Excess MCQ / MOQ Manual Overrides (per-scenario) */}
-      {activeTab === "excess" && (() => {
-        const matchingPr = entries.find(e =>
-          e.colorCode === newOverColor &&
-          (!newOverItemCode || e.itemCode === newOverItemCode)
-        );
-        const foundUnitPrice = matchingPr ? matchingPr.unitPrice : 0;
-        const foundCbmPerUnit = matchingPr && matchingPr.qty > 0 ? matchingPr.cbm / matchingPr.qty : 0.003;
-
-        return (
-          <div className="space-y-4">
-            <div className="bg-violet-50 border border-violet-100 p-3 rounded-lg text-[11px] text-slate-600 leading-relaxed">
-              <strong>{t("Excess MCQ Overrides:", lang)}</strong> {t("Select a color and optionally a specific item, then specify the additional quantity to add. Price and CBM per unit are automatically retrieved from the dataset to ensure total landed cost and volume update correctly.", lang)}
-            </div>
-
-            <div className="space-y-2.5 bg-slate-50 border border-slate-100 p-3 rounded-lg">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{t("Inject Order Padding Override", lang)}</span>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="col-span-2">
-                  <label className="block text-[9px] font-semibold text-slate-500 mb-1">{t("Color Code", lang)}</label>
-                  <select
-                    value={newOverColor}
-                    onChange={e => setNewOverColor(e.target.value)}
-                    className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    {uniqueColors.length === 0 ? (
-                      <option value="">No colors available</option>
-                    ) : (
-                      uniqueColors.map(color => (
-                        <option key={color} value={color}>{color}</option>
-                      ))
-                    )}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[9px] font-semibold text-slate-500 mb-1">{t("Item Code (Optional)", lang)}</label>
-                  <select
-                    value={newOverItemCode}
-                    onChange={e => setNewOverItemCode(e.target.value)}
-                    className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    <option value="">{t("All Items under Color", lang)}</option>
-                    {uniqueItems.map(item => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-[9px] font-semibold text-slate-500 mb-1">{t("Target Shipment", lang)}</label>
-                  <select
-                    value={newOverWeek}
-                    onChange={e => setNewOverWeek(parseInt(e.target.value) || 0)}
-                    className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    <option value="0">{t("Auto / Under MCQ", lang)}</option>
-                    {Array.from({ length: scenario.shipments.length }, (_, i) => i + 1).map((w) => (
-                      <option key={w} value={w}>
-                        {lang === "TH" ? `ชิปเมนต์ ${w}` : `Shipment ${w}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="col-span-2">
-                  <label className="block text-[9px] font-semibold text-slate-500 mb-1">{t("Additional Qty (YD)", lang)}</label>
-                  <input
-                    type="number"
-                    value={newOverQty || ""}
-                    onChange={e => setNewOverQty(parseInt(e.target.value) || 0)}
-                    placeholder="e.g. 500"
-                    className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs font-mono text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-
-                {/* Auto-Looked Up Display Fields */}
-                <div className="col-span-2 grid grid-cols-2 gap-3 bg-violet-100/40 p-2.5 rounded-lg border border-violet-200/50 mt-1">
-                  <div>
-                    <span className="text-slate-400 block uppercase font-bold text-[8px] tracking-wider mb-0.5">{t("Retrieved Unit Price", lang)}</span>
-                    <span className="font-mono text-violet-800 font-semibold text-xs">
-                      {foundUnitPrice > 0
-                        ? (foundUnitPrice > 30 ? `${foundUnitPrice.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2})} THB` : `$${foundUnitPrice.toFixed(2)} USD`)
-                        : "N/A"
-                      }
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-400 block uppercase font-bold text-[8px] tracking-wider mb-0.5">{t("Retrieved CBM per YD", lang)}</span>
-                    <span className="font-mono text-violet-800 font-semibold text-xs">
-                      {matchingPr ? `${foundCbmPerUnit.toFixed(5)} CBM` : "0.00300 CBM (Default)"}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
+            <div className="shrink-0">
               <button
-                onClick={handleAddOverride}
-                className="w-full bg-violet-600 hover:bg-violet-700 text-white rounded py-1.5 text-xs font-semibold mt-2 cursor-pointer transition flex items-center justify-center gap-1"
+                onClick={loadSample}
+                className="bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition duration-200"
               >
-                <Plus size={12} /> {t("Add Padding Override", lang)}
+                <Database size={13} className="text-emerald-600" />
+                {t("Load VT Garment Sample Data", lang)}
               </button>
             </div>
+          </div>
 
-            {excessOverrides.length > 0 && (
-              <div className="border border-slate-100 rounded-lg overflow-hidden mt-3">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-50 text-slate-400 font-bold text-[10px] uppercase">
-                    <tr>
-                      <th className="p-2">{t("Color / Item", lang)}</th>
-                      <th className="p-2">{t("Target", lang)}</th>
-                      <th className="p-2 text-right">{t("Padded Qty", lang)}</th>
-                      <th className="p-2 text-right">{t("Price", lang)}</th>
-                      <th className="p-2"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-50">
-                    {excessOverrides.map(o => (
-                      <tr key={o.id} className="text-slate-600 hover:bg-slate-50">
-                        <td className="p-2 font-medium">
-                          <div className="truncate max-w-[120px]">{o.colorCode}</div>
-                          {o.itemCode && <div className="text-[9px] text-slate-400 font-mono">{o.itemCode}</div>}
-                        </td>
-                        <td className="p-2 font-mono text-slate-500">
-                          {o.targetWeek ? `${t("Week", lang)} ${o.targetWeek}` : t("Auto / Under MCQ", lang)}
-                        </td>
-                        <td className="p-2 text-right font-mono text-violet-600 font-bold">+{o.additionalQty} YD</td>
-                        <td className="p-2 text-right font-mono">${o.pricePerUnit?.toFixed(2) || "Default"}</td>
-                        <td className="p-2">
-                          <button
-                            onClick={() => handleRemoveOverride(o.id)}
-                            className="text-red-500 hover:text-red-700 transition cursor-pointer"
-                          >
-                            <Trash2 size={12} />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+          {error && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 flex items-start gap-2.5">
+              <AlertCircle size={16} className="text-red-600 mt-0.5 shrink-0" />
+              <div>
+                <div className="text-xs font-semibold text-red-800">Data Parsing Error</div>
+                <div className="text-[11px] text-red-600 mt-0.5 leading-relaxed">{error}</div>
+              </div>
+            </div>
+          )}
+
+          <div className="flex-1 flex flex-col justify-center">
+            {/* Main Upload Dropzone */}
+            {!showMappingGui ? (
+              <div
+                onDragEnter={handleDrag}
+                onDragOver={handleDrag}
+                onDragLeave={handleDrag}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition duration-300 h-full min-h-[140px] ${
+                  dragActive
+                    ? "border-blue-500 bg-blue-50/50"
+                    : "border-slate-200 bg-slate-50/30 hover:border-slate-300 hover:bg-slate-50/80"
+                }`}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".xlsx,.xls,.csv"
+                  onChange={handleInputChange}
+                  className="hidden"
+                />
+
+                <div className="bg-white border border-slate-200 p-2 rounded-lg text-slate-400 mb-2 shadow-sm">
+                  <Upload size={20} className="text-blue-600 animate-pulse" />
+                </div>
+
+                <div className="text-xs font-semibold text-slate-700">
+                  {fileName ? (
+                    <span className="text-blue-600 flex items-center gap-1.5 justify-center font-semibold">
+                      <Check size={14} className="text-emerald-600" /> {fileName}
+                    </span>
+                  ) : (
+                    t("Drag & Drop Syteline sheet (.xlsx, .xls, .csv)", lang)
+                  )}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-1">
+                  {t("or click to browse your computer's files", lang)}
+                </div>
+
+                {currentCount > 0 && (
+                  <div className="mt-2.5 bg-blue-50 text-blue-700 border border-blue-100 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-medium">
+                    {t("Active Ledger: ", lang)} {currentCount} {t(" PR entries loaded", lang)}
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Column Mapping GUI if Auto-map fails or has ambiguities */
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <AlertCircle className="text-amber-600 animate-bounce" size={16} />
+                  <span className="text-xs font-bold text-amber-800">
+                    Confirm Column Field Mapping
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
+                  We couldn't resolve all of Syteline's headers. Please map the columns of your uploaded sheet:
+                </p>
+
+                <div className="grid grid-cols-2 gap-2 mb-3 max-h-[140px] overflow-y-auto pr-1">
+                  {/* Item Code Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Item Code <span className="text-red-500">*</span>
+                    </label>
+                    <select
+                      value={mapping.itemCode}
+                      onChange={(e) => setMapping({ ...mapping, itemCode: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Select --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Color Code Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Color Code <span className="text-red-500">*</span>
+                    </label>
+                    <select
+                      value={mapping.colorCode}
+                      onChange={(e) => setMapping({ ...mapping, colorCode: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Select --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Quantity Ordered Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Quantity <span className="text-red-500">*</span>
+                    </label>
+                    <select
+                      value={mapping.qty}
+                      onChange={(e) => setMapping({ ...mapping, qty: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Select --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Unit Price Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Unit Price <span className="text-red-500">*</span>
+                    </label>
+                    <select
+                      value={mapping.unitPrice}
+                      onChange={(e) => setMapping({ ...mapping, unitPrice: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Select --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* PR Due Date Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Due Date <span className="text-red-500">*</span>
+                    </label>
+                    <select
+                      value={mapping.prDueDate}
+                      onChange={(e) => setMapping({ ...mapping, prDueDate: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Select --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Volume CBM Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Volume (CBM)
+                    </label>
+                    <select
+                      value={mapping.cbm}
+                      onChange={(e) => setMapping({ ...mapping, cbm: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Auto-calc --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Vendor Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Vendor / Supplier
+                    </label>
+                    <select
+                      value={mapping.vendor}
+                      onChange={(e) => setMapping({ ...mapping, vendor: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Auto-detect (Fallback) --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Currency Code Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Currency Code
+                    </label>
+                    <select
+                      value={mapping.currency}
+                      onChange={(e) => setMapping({ ...mapping, currency: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Auto-detect --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+
+                  {/* Currency Rate Mapping */}
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">
+                      Exchange Rate Column
+                    </label>
+                    <select
+                      value={mapping.currencyRate}
+                      onChange={(e) => setMapping({ ...mapping, currencyRate: e.target.value })}
+                      className="w-full bg-white border border-slate-200 rounded px-2 py-0.5 text-[11px] text-slate-800 focus:outline-none"
+                    >
+                      <option value="">-- Auto-detect --</option>
+                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex gap-2 justify-end">
+                  <button
+                    onClick={() => {
+                      setShowMappingGui(false);
+                      setRawRows(null);
+                      setFileName(null);
+                    }}
+                    className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-3 py-1 rounded text-xs font-semibold"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => rawRows && applyMapping(rawRows, mapping)}
+                    disabled={!mapping.itemCode || !mapping.colorCode || !mapping.qty || !mapping.prDueDate || !mapping.unitPrice}
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-xs font-semibold flex items-center gap-1 disabled:opacity-40"
+                  >
+                    <RefreshCw size={11} /> Apply
+                  </button>
+                </div>
               </div>
             )}
           </div>
-        );
-      })()}
+        </div>
 
-      {/* Tab 2: Shipment Group Details */}
-      {activeTab === "shipments" && (
-        <div className="space-y-6">
-          <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4 flex gap-3 text-xs text-slate-600 leading-relaxed">
-            <Info size={18} className="text-blue-600 shrink-0 mt-0.5" />
-            <div>
-              <span className="text-blue-900 font-bold">Interactive Shipment Planning:</span> Drag and drop any materials between shipment cards to reschedule them manually, or use the drop-down selector on each line. The logistics engine will instantly re-calculate ocean freight container packing, MCQ surcharges, carrying penalties, and total landed costs!
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {shipmentColumns.map((ship, idx) => {
-              const isLcl = ship.container.isLcl;
-
-              return (
-                <div 
-                  key={idx} 
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    if (draggedOverWeek !== ship.week) {
-                      setDraggedOverWeek(ship.week);
-                    }
-                  }}
-                  onDragLeave={() => {
-                    setDraggedOverWeek(null);
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    setDraggedOverWeek(null);
-                    const prId = e.dataTransfer.getData("text/plain");
-                    if (prId && onMovePrLine) {
-                      onMovePrLine(prId, ship.week);
-                    }
-                  }}
-                  className={`bg-slate-50/50 border rounded-xl p-5 shadow-sm flex flex-col justify-between transition-all duration-200 ${
-                    draggedOverWeek === ship.week
-                      ? "border-blue-500 ring-4 ring-blue-500/10 bg-blue-50/30 scale-[1.01]"
-                      : "border-slate-200"
-                  }`}
-                >
-                  <div>
-                    <div className="flex justify-between items-start mb-4">
-                      <div>
-                        <span className="bg-blue-50 text-blue-700 border border-blue-100 px-2 py-0.5 rounded text-[10px] font-mono font-bold">
-                          SHIPMENT {idx + 1}
-                        </span>
-                        <h4 className="text-base font-bold text-slate-800 mt-1">
-                          Shipment Date: {formatDate(ship.shipmentDate || ship.date)}
-                        </h4>
-                      </div>
-                      <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
-                        isLcl ? "bg-amber-50 text-amber-700 border border-amber-100" : "bg-blue-50 text-blue-700 border border-blue-100"
-                      }`}>
-                        {isLcl ? "LCL Cargo" : "FCL Cargo"}
-                      </span>
-                    </div>
-
-                    <div className="bg-white border border-slate-200 p-3.5 rounded-lg mb-4">
-                      <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">
-                        Assigned Containers
-                      </div>
-                      <div className="text-sm font-bold text-slate-800 font-mono mt-1">
-                        {ship.container.name}
-                      </div>
-                      <div className="text-xs text-slate-500 mt-1">
-                        Total Volume: {ship.totalCbm.toFixed(3)} CBM | Quantity: {Math.round(ship.totalQty).toLocaleString()} YD
-                      </div>
-
-                      {ship.container.status && (
-                        <div className={`mt-2.5 p-2 rounded text-[11px] leading-relaxed flex items-start gap-1.5 border ${
-                          ship.container.status === "NOT Acceptable"
-                            ? "bg-rose-50 text-rose-800 border-rose-200"
-                            : ship.container.status === "Review Needed"
-                            ? "bg-amber-50 text-amber-800 border-amber-200"
-                            : "bg-emerald-50 text-emerald-800 border-emerald-200"
-                        }`}>
-                          {ship.container.status === "NOT Acceptable" ? (
-                            <AlertTriangle size={13} className="text-rose-600 shrink-0 mt-0.5" />
-                          ) : ship.container.status === "Review Needed" ? (
-                            <AlertTriangle size={13} className="text-amber-600 shrink-0 mt-0.5" />
-                          ) : (
-                            <CheckCircle2 size={13} className="text-emerald-600 shrink-0 mt-0.5" />
-                          )}
-                          <span>
-                            <strong className="font-semibold">{ship.container.status}:</strong> {ship.container.statusDetails}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Cost Breakdown */}
-                    <div className="space-y-2 border-t border-slate-200 pt-4 text-xs mb-4">
-                      <div className="flex justify-between text-slate-500">
-                        <span>Ocean Freight Tariff:</span>
-                        <span className="font-mono text-slate-700">{Math.round(ship.freightCost).toLocaleString()} THB</span>
-                      </div>
-                      <div className="flex justify-between text-slate-500">
-                        <span>Local Port Dues & Delivery:</span>
-                        <span className="font-mono text-slate-700">{Math.round(ship.localCost).toLocaleString()} THB</span>
-                      </div>
-                      <div className="flex justify-between text-slate-500">
-                        <span>Customs Brokerage Dues:</span>
-                        <span className="font-mono text-slate-700">{Math.round(ship.brokerageCost).toLocaleString()} THB</span>
-                      </div>
-                      <div className="flex justify-between text-slate-500 group relative">
-                        <span className="flex items-center gap-1 cursor-help border-b border-dotted border-slate-400">
-                          Carrying Cost Penalty:
-                          <span className="invisible group-hover:visible absolute left-0 bottom-6 z-10 w-64 p-2 bg-slate-800 text-white text-[10px] rounded-lg shadow-lg leading-normal">
-                            Formula: (Shipment Value ÷ 2) × Carrying Rate × (Days Early / 365)<br/>
-                            <span className="text-slate-300 font-mono">Shipment Value = Material Cost + MOQ Excess Cost</span>
-                          </span>
-                        </span>
-                        <span className="font-mono text-slate-700">{Math.round(ship.carryingCost).toLocaleString()} THB</span>
-                      </div>
-                      <div className="flex justify-between text-slate-500 group relative">
-                        <span className="flex items-center gap-1 cursor-help border-b border-dotted border-slate-400">
-                          Capital Opportunity Cost:
-                          <span className="invisible group-hover:visible absolute left-0 bottom-6 z-10 w-64 p-2 bg-slate-800 text-white text-[10px] rounded-lg shadow-lg leading-normal">
-                            Formula: Shipment Value × [ (1 + Opportunity Rate)^(Days Early / 365) − 1 ]<br/>
-                            <span className="text-slate-300 font-mono">Opportunity Rate = WACC %</span>
-                          </span>
-                        </span>
-                        <span className="font-mono text-slate-700">{Math.round(ship.opportunityCost).toLocaleString()} THB</span>
-                      </div>
-                      <div className="flex justify-between font-bold border-t border-slate-200 pt-2 text-blue-600">
-                        <span>Subtotal Cost:</span>
-                        <span className="font-mono">{Math.round(ship.totalLandedCost).toLocaleString()} THB</span>
-                      </div>
-                    </div>
+        {/* Right Column: VT Planning Rules Summary */}
+        <div className="bg-slate-50/70 border border-slate-150 rounded-xl p-5 flex flex-col justify-between h-full">
+          <div>
+            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5 mb-3">
+              <HelpCircle size={14} className="text-blue-600" />
+              {t("VT Planning Rules Summary", lang)}
+            </h4>
+            <ul className="space-y-3.5 text-[11px] text-slate-500 leading-relaxed">
+              <li className="flex items-start gap-2">
+                <span className="text-blue-600 shrink-0 mt-0.5">●</span>
+                <span>
+                  <strong className="text-slate-700">{t("Days Early (Shipment classification):", lang)}</strong>
+                  <div className="pl-4 mt-1.5 space-y-1 text-xs text-slate-600">
+                    <div>{t("• Baseline: the earliest PR Due Date sets the base PO Due Date, shifted backward to the nearest allowed vendor loading day.", lang)}</div>
+                    <div>{t("• Grouping: sorted Days Early values are clustered dynamically — each group spans a rolling 7-day window from its own start date, not fixed weekly buckets.", lang)}</div>
+                    <div>{t("• Scenario count: the number of groups sets the maximum number of shipments (e.g. 15 groups → Scenarios 1–15).", lang)}</div>
+                    <div>{t("• Splitting: Scenario N splits at the N-1 largest gaps between groups; equal-sized gaps produce numbered variants (e.g. 2.1, 2.2).", lang)}</div>
+                    <div>{t("• Each shipment's PO Due Date is its group's earliest PR Due Date, aligned backward to the nearest allowed loading day.", lang)}</div>
                   </div>
+                </span>
+              </li>
 
-                  {/* Shipment items list */}
-                  <div className="border-t border-slate-200 pt-4">
-                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-2">
-                      Consolidated Materials ({ship.items.length})
-                    </span>
-                    <div className="max-h-48 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                      {ship.items.map((item, itemIdx) => (
-                        <div 
-                          key={item.id || itemIdx} 
-                          draggable={true}
-                          onDragStart={(e) => {
-                            e.dataTransfer.setData("text/plain", item.id);
-                          }}
-                          className="bg-white border border-slate-200 hover:border-blue-300 p-2 rounded flex justify-between items-center text-[11px] font-mono text-slate-700 hover:bg-blue-50/20 active:cursor-grabbing hover:cursor-grab transition duration-150 group"
-                        >
-                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                            <span className="text-slate-400 shrink-0 cursor-grab hover:text-blue-500" title="Drag to reschedule">
-                              <GripVertical size={13} />
-                            </span>
-                            <span className="text-slate-500 truncate max-w-[12rem]" title={item.itemDescription || item.itemCode}>
-                              {item.id}: {item.itemCode}
-                            </span>
-                            <span className="bg-slate-100 text-slate-600 px-1 py-0.2 rounded text-[9px] shrink-0 font-bold uppercase">
-                              {item.colorCode}
-                            </span>
-                          </div>
-                          
-                          <div className="flex items-center gap-2">
-                            <span className="text-slate-800 font-bold whitespace-nowrap">{Math.round(item.qty).toLocaleString()} YD</span>
-                            
-                            {onMovePrLine && scenario.weeks.length > 1 && (
-                              <select
-                                value={ship.week}
-                                onChange={(e) => {
-                                  const targetW = parseInt(e.target.value, 10);
-                                  if (targetW !== ship.week) {
-                                    onMovePrLine(item.id, targetW);
-                                  }
-                                }}
-                                className="bg-slate-50 border border-slate-200 text-[10px] text-slate-600 rounded px-1.5 py-0.5 ml-1 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer hover:bg-slate-100"
-                                title="Reschedule to shipment week"
-                              >
-                                {scenario.weeks.map(w => (
-                                  <option key={w} value={w}>
-                                    S{w}
-                                  </option>
-                                ))}
-                              </select>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+              <li className="flex items-start gap-2">
+                <span className="text-blue-600 shrink-0 mt-0.5">●</span>
+                <span>
+                  <strong className="text-slate-700">{t("Excess Propagation:", lang)}</strong> {t("rounds the first shipment UP, then propagates excess forward to round subsequent shipments up or down.", lang)}
+                </span>
+              </li>
+              <li className="flex items-start gap-2">
+                <span className="text-blue-600 shrink-0 mt-0.5">●</span>
+                <span>
+                  <strong className="text-slate-700">{lang === "TH" ? "MCQ Push-Forward (การเลื่อนแผนจัดส่งล่วงหน้า):" : "MCQ Push-Forward:"}</strong> {lang === "TH" ? "ดึงม้วนผ้าที่มีจำนวนต่ำกว่าเกณฑ์ MCQ ขึ้นมาจัดส่งรอบก่อนหน้าเพื่อประหยัดค่าระวางเรือโดยเลี่ยงค่าปรับยอดขั้นต่ำ" : "sub-MOQ color-shipments shift earlier to optimize ocean freight without incurring MOQ penalties."}
+                </span>
+              </li>
+            </ul>
+          </div>
+          
+          <div className="mt-4 border-t border-slate-200/60 pt-3 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{t("Validation Rules Mode: Standard", lang)}</span>
+            <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-mono font-medium">{t("ACTIVE", lang)}</span>
           </div>
         </div>
-      )}
 
-      {/* Tab 3: Duplicate PR Rounded Ledger */}
-      {activeTab === "ledger" && (
-        <div className="space-y-4">
-          <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-4 flex gap-3 text-xs text-slate-600 leading-relaxed">
-            <CheckSquare size={18} className="text-emerald-600 shrink-0 mt-0.5" />
-            <div>
-              <span className="text-blue-900 font-bold">{t("Final Mapped Syteline Planning Sheet (Duplicated & Balanced):", lang)}</span> {t("This duplicate PR ledger reflects the exact rounded integer purchase quantities, adjusted proportionate CBM volumes, and actual financial Carrying & Capital opportunity penalty costs for each entry. Rounding or MCQ/MOQ excess is automatically compiled and added directly to the latest entry on that shipment date as required.", lang)}
-            </div>
-          </div>
-
-          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-            <table className="w-full text-xs text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold text-[10px] uppercase tracking-wider">
-                  <th className="py-3 px-3">PR ID</th>
-                  <th className="py-3 px-3">Item Code</th>
-                  <th className="py-3 px-3">Color</th>
-                  <th className="py-3 px-3 text-right">Original Qty</th>
-                  <th className="py-3 px-3 text-right">Final Qty</th>
-                  <th className="py-3 px-3 text-center">Rounding/MOQ Excess</th>
-                  <th className="py-3 px-3 text-right">Price</th>
-                  <th className="py-3 px-3 text-center">PR Due Date</th>
-                  <th className="py-3 px-3 text-center">PO Due Date</th>
-                  <th className="py-3 px-3 text-center">Days Early</th>
-                  <th className="py-3 px-3 text-right">Volume (CBM)</th>
-                  <th className="py-3 px-3 text-right">Material Value</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {scenario.processedEntries.map((pr, idx) => {
-                  const excess = (pr.excessQty || 0);
-                  const isPositiveExcess = excess > 0.0001;
-                  const isNegativeExcess = excess < -0.0001;
-
-                  return (
-                    <tr key={idx} className="hover:bg-slate-50">
-                      <td className="py-3 px-3 font-mono text-slate-400 font-medium">
-                        {pr.id}
-                      </td>
-                      <td className="py-3 px-3 font-semibold text-slate-700">
-                        {pr.itemCode}
-                      </td>
-                      <td className="py-3 px-3 font-mono text-slate-500">
-                        {pr.colorCode}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-500">
-                        {pr.originalQty.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono font-bold text-slate-800">
-                        {pr.qty.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
-                      </td>
-                      <td className="py-3 px-3 text-center">
-                        {isPositiveExcess ? (
-                          <span className="bg-emerald-50 text-emerald-700 border border-emerald-100 px-2 py-0.5 rounded font-mono text-[10px] font-semibold inline-flex items-center gap-0.5">
-                            <Plus size={10} /> {excess.toFixed(2)}
-                          </span>
-                        ) : isNegativeExcess ? (
-                          <span className="bg-red-50 text-red-700 border border-red-100 px-2 py-0.5 rounded font-mono text-[10px] font-semibold inline-flex items-center gap-0.5">
-                            <Minus size={10} /> {Math.abs(excess).toFixed(2)}
-                          </span>
-                        ) : (
-                          <span className="text-slate-300 font-mono">-</span>
-                        )}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-500">
-                        {pr.unitPrice.toFixed(2)}
-                      </td>
-                      <td className="py-3 px-3 text-center font-mono text-slate-500">
-                        {formatDate(pr.dueDateRaw || pr.prDueDate)}
-                      </td>
-                      <td className="py-3 px-3 text-center font-mono text-blue-600 font-semibold">
-                        {formatDate(pr.poDueDate)}
-                      </td>
-                      <td className={`py-3 px-3 text-center font-mono font-bold ${
-                        (pr.daysEarly || 0) < 0 ? "text-red-600 font-bold" : (pr.daysEarly || 0) > 0 ? "text-slate-500" : "text-emerald-700 font-black"
-                      }`}>
-                        {pr.daysEarly} days
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-500">
-                        {pr.cbm.toFixed(4)}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-600">
-                        {(() => {
-                          const currCode = (pr.currency || "").toUpperCase().trim();
-                          const rate = pr.currencyRate !== undefined && pr.currencyRate !== null
-                            ? pr.currencyRate
-                            : (currCode === "THB"
-                                ? 1.0
-                                : (currCode && scenario.exchangeRates?.[currCode] !== undefined
-                                    ? scenario.exchangeRates[currCode]
-                                    : (pr.unitPrice > 30 ? 1.0 : (scenario.exchangeRates?.["USD"] || 35.0))
-                                  )
-                              );
-                          return (pr.qty * pr.unitPrice * rate).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-                        })()} THB
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Tab 4: Syteline Requisition & Line Columns Output */}
-      {activeTab === "requisitions" && (
-        <div className="space-y-4">
-          <div className="bg-emerald-50/60 border border-emerald-100 rounded-xl p-4 flex gap-3 text-xs text-slate-700 leading-relaxed">
-            <CheckSquare size={18} className="text-emerald-600 shrink-0 mt-0.5" />
-            <div>
-              <span className="text-emerald-900 font-bold">Official Requisition Mapping Worksheet:</span> Below is the official compiled Syteline Requisition schedule for <strong>Scenario {scenario.id}</strong>. In keeping with Syteline standards, we output the <strong>Requisition</strong> and <strong>Line</strong> columns mapped alongside their optimized quantities and delivery structures.
-            </div>
-          </div>
-
-          <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white shadow-sm">
-            <table className="w-full text-xs text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold text-[10px] uppercase tracking-wider">
-                  <th className="py-3 px-4">Requisition No.</th>
-                  <th className="py-3 px-4 text-center">Line No.</th>
-                  <th className="py-3 px-4">Item Code</th>
-                  <th className="py-3 px-4">Color Description</th>
-                  <th className="py-3 px-4 text-right">Optimized Qty</th>
-                  <th className="py-3 px-4 text-center">UOM</th>
-                  <th className="py-3 px-4 text-center">PO Delivery Date</th>
-                  <th className="py-3 px-4 text-center">PR Due Date</th>
-                  <th className="py-3 px-4 text-center">Days Early</th>
-                  <th className="py-3 px-4 text-center">PR Delivery Date (Vendor Loading)</th>
-                  <th className="py-3 px-4 text-center">PO Due Date (Arrival at VT)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {(() => {
-                  // Determine loading date according to shipping rules
-                  const getVendorLoadingDate = (shipmentDate: Date, origin: string): Date => {
-                    const dateCopy = new Date(shipmentDate);
-                    const originUpper = origin.toUpperCase();
-                    
-                    if (originUpper.includes("TAIWAN") || originUpper.includes("KEELUNG")) {
-                      // Taiwan Keelung: Tuesday and Friday.
-                      const day = dateCopy.getDay(); // 0 = Sunday, 1 = Monday, 2 = Tuesday, 3 = Wednesday, 4 = Thursday, 5 = Friday, 6 = Saturday
-                      if (day === 2 || day === 5) return dateCopy;
-                      while (dateCopy.getDay() !== 2 && dateCopy.getDay() !== 5) {
-                        dateCopy.setDate(dateCopy.getDate() - 1);
-                      }
-                      return dateCopy;
-                    } else {
-                      // Other Countries: Monday.
-                      const day = dateCopy.getDay();
-                      if (day === 1) return dateCopy;
-                      while (dateCopy.getDay() !== 1) {
-                        dateCopy.setDate(dateCopy.getDate() - 1);
-                      }
-                      return dateCopy;
-                    }
-                  };
-
-                  return scenario.processedEntries.map((pr, idx) => {
-                    // Derive shipping date associated with the assigned week
-                    const shipmentGroup = scenario.shipments.find(s => s.week === pr.assignedWeek);
-                    const shipmentDate = shipmentGroup?.shipmentDate || new Date();
-                    const loadingDate = pr.actualDelivery || pr.prDueDate; // PR Delivery Date (Vendor Loading) — the ex-port ship date
-
-                    // Requisition usually uses the PR row ID or the PR document
-                    const requisitionNo = pr.id;
-                    const lineNo = idx + 1; // Standard 1, 2, 3 sequence
-
-                    return (
-                      <tr key={idx} className="hover:bg-slate-50 font-mono text-[11px]">
-                        <td className="py-3 px-4 font-bold text-slate-800">
-                          {requisitionNo}
-                        </td>
-                        <td className="py-3 px-4 text-center text-slate-500 font-semibold">
-                          {lineNo}
-                        </td>
-                        <td className="py-3 px-4 text-slate-700 font-bold">
-                          {pr.itemCode}
-                        </td>
-                        <td className="py-3 px-4 text-slate-600 font-sans">
-                          {pr.colorCode}
-                        </td>
-                        <td className="py-3 px-4 text-right font-bold text-blue-600">
-                          {Math.round(pr.qty).toLocaleString()}
-                        </td>
-                        <td className="py-3 px-4 text-center text-slate-400 font-sans font-bold">
-                          YD
-                        </td>
-                        <td className="py-3 px-4 text-center text-slate-500">
-                          {formatDate(shipmentDate)}
-                        </td>
-                        <td className="py-3 px-4 text-center text-slate-500">
-                          {formatDate(pr.dueDateRaw || pr.prDueDate)}
-                        </td>
-                        <td className={`py-3 px-4 text-center font-bold ${
-                          (pr.daysEarly || 0) < 0 ? "text-red-600 font-bold" : (pr.daysEarly || 0) > 0 ? "text-slate-500" : "text-emerald-700 font-black"
-                        }`}>
-                          {pr.daysEarly} days
-                        </td>
-                        <td className="py-3 px-4 text-center text-emerald-700 font-bold">
-                          {formatDate(loadingDate)}
-                        </td>
-                        <td className="py-3 px-4 text-center text-blue-700 font-bold">
-                          {formatDate(pr.poDueDate)}
-                        </td>
-                      </tr>
-                    );
-                  });
-                })()}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
